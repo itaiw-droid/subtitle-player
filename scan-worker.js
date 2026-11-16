@@ -8,12 +8,19 @@
 
 const RX0 = 0.06, RX1 = 0.94, RY0 = 0.58, RY1 = 0.985;
 const MIN_PIXELS = 60;
-const SIM = 0.6;
+// How alike two frames' lettering must be to count as the same subtitle. Strict on purpose: splitting
+// one subtitle in two is harmless (identical neighbours are re-joined after OCR), merging two
+// different subtitles makes the English lag behind the Hebrew.
+const SIM = 0.72;
 
 let W = 0, H = 0, rx0 = 0, ry0 = 0, rw = 0, rh = 0, step = 2, interval = 1 / 6;
 let current = null;   // subtitle currently on screen
 let pending = null;   // a change seen once, waiting for confirmation {t, mask}
 let lastProgress = -1;
+let lastT = null;      // time of the previous sample
+// A change happened somewhere between the last sample that still showed the old picture and the
+// first that showed the new one: use the midpoint (halves the timing error).
+const boundary = (p) => (p.prev != null && p.t - p.prev < 0.5 ? (p.prev + p.t) / 2 : p.t);
 let rangeStart = 0;
 let gen = 0;
 // Every message carries the scan session id so the page can ignore leftovers from a stopped scan.
@@ -346,21 +353,24 @@ function onFrame(t, d) {
       const wn = whiteness(d);
       const mw = c.minW;
       for (let i = 0; i < wn.length; i++) if (wn[i] < mw[i]) mw[i] = wn[i];
-      if (mask.count > c.bestCount + (c.bestCount >> 3)) {
+      // Only a clearly fuller frame of the *same* lettering (fade-in) becomes the reference.
+      if (mask.count > c.bestCount + (c.bestCount >> 3) && similar(c.mask, mask) >= 0.85) {
         c.box = maskBox(mask); c.crop = colorCrop(d, c.box); c.bestCount = mask.count; c.mask = mask;
       }
     } else if (pending && (hasText ? pending.mask.count > 0 && similar(pending.mask, mask) >= SIM : pending.mask.count < MIN_PIXELS)) {
-      finish(c, pending.t, false);
-      current = hasText ? newCandidate(pending.t) : null;
+      const at = boundary(pending);
+      finish(c, at, false);
+      current = hasText ? newCandidate(at) : null;
       pending = null;
     } else {
-      pending = { t, mask: hasText ? mask : { count: 0 } };
+      pending = { t, prev: lastT, mask: hasText ? mask : { count: 0 } };
     }
   } else if (hasText) {
-    if (pending && pending.mask.count > 0 && similar(pending.mask, mask) >= SIM) { current = newCandidate(pending.t); pending = null; }
-    else pending = { t, mask };
+    if (pending && pending.mask.count > 0 && similar(pending.mask, mask) >= SIM) { current = newCandidate(boundary(pending)); pending = null; }
+    else pending = { t, prev: lastT, mask };
   } else pending = null;
 
+  lastT = t;
   if (t - lastProgress >= 1) {
     lastProgress = t;
     post({ type: 'progress', t, safe: current ? current.start : pending ? pending.t : t });
@@ -374,7 +384,7 @@ onmessage = async (e) => {
     const r = region(W, H);
     rx0 = r.x0; ry0 = r.y0; rw = r.w; rh = r.h;
     step = Math.max(1, Math.floor(W / 640));
-    current = null; pending = null; lastProgress = -1; rangeStart = m.from;
+    current = null; pending = null; lastProgress = -1; lastT = null; rangeStart = m.from;
     post({ type: 'region', x0: rx0, y0: ry0, w: rw, h: rh });
   } else if (m.type === 'frame') {
     onFrame(m.t, new Uint8ClampedArray(m.data));

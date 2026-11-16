@@ -17,9 +17,11 @@ never uploaded. Subtitles and edits are saved in your browser only.
 Keys: Space play/pause · ←/→ 5 s · S subtitle mode (English / Hebrew / Both / Off) ·
 E subtitle list · − / + subtitle size (also the A− / A+ buttons) · F fullscreen · Esc back.
 
-Subtitles keep one text size and a steady backdrop: the app learns where the episode's subtitles sit
-and uses the same box for every one-line subtitle (and one for two-line ones), growing it only when
-needed to cover the Hebrew underneath.
+English subtitles sit in one fixed box at the spot where the episode's burned-in Hebrew subtitles are —
+same size and position for every line, whatever its length (very long lines shrink slightly to fit).
+Subtitle timing is frame-accurate: the scanner reads exact video frames, ~10 times per second of video,
+so the English appears and disappears with the Hebrew. Episodes added before this improvement show a
+**Redo subtitles** button to re-read them with the new timing.
 
 In the subtitle list, lines the app is unsure of are marked **Check Hebrew**. Fix a Hebrew line and it
 is re-translated; or edit the English directly.

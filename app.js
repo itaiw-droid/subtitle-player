@@ -18,8 +18,9 @@ let toastTimer;
 function toast(msg, ms = 3500) { const t = $('#toast'); t.textContent = msg; t.classList.remove('hidden'); clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.add('hidden'), ms); }
 
 const LOW_CONFIDENCE = 0.72;
-const SCAN_RATE = 6;          // hidden scanner plays at 6x
-const SAMPLE_INTERVAL = 1 / 6;
+const SCANNER_VERSION = 2; // 2 = frame-accurate timing
+const SCAN_RATE = 4;            // hidden scanner plays at 4x (fast, without dropping frames)
+const SAMPLE_INTERVAL = 1 / 10; // look at the subtitle area every 0.1 s of video
 
 // =====================================================================
 // IndexedDB
@@ -217,7 +218,7 @@ async function createEpisode(chosenFile, handle, show, mode) {
     id: uid(), fileName: f.name, size: f.size, lastModified: f.lastModified,
     title: show.trim() || f.name.replace(/\.[^.]+$/, ''), show: show.trim(),
     duration: info.duration, width: info.width, height: info.height,
-    mode, status: 'processing', coverage: [], lastPosition: 0, createdAt: Date.now(),
+    mode, status: 'processing', coverage: [], lastPosition: 0, createdAt: Date.now(), scanVersion: SCANNER_VERSION,
   };
   episodes.set(ep.id, ep); cuesById.set(ep.id, []); files.set(ep.id, f);
   await DB.put('episodes', ep.id, ep);
@@ -227,6 +228,23 @@ async function createEpisode(chosenFile, handle, show, mode) {
   libDirty = true;
   tick();
   return ep;
+}
+
+// Throw away an episode's subtitles and read them again (e.g. after a scanner improvement).
+async function redoEpisode(id) {
+  const ep = episodes.get(id);
+  if (!ep) return;
+  if (Scan.ep && Scan.ep.id === id) Scan.stop();
+  const thumb = await DB.get('blobs', id + '/thumb');
+  await DB.delRange('blobs', id + '/');
+  if (thumb) await DB.put('blobs', id + '/thumb', thumb);
+  cuesById.set(id, []);
+  ep.coverage = []; delete ep.band; ep.status = 'processing'; ep.scanVersion = SCANNER_VERSION;
+  await DB.put('cues', id, []);
+  saveEp(ep);
+  if (P.id === id) { P.cues = cuesById.get(id); P.cueEls.clear(); $('#cue-list').innerHTML = ''; computeBand(); renderOverlay(true); }
+  libDirty = true;
+  tick();
 }
 
 async function deleteEpisode(id) {
@@ -261,25 +279,43 @@ const Scan = {
     v.currentTime = from;
     v.playbackRate = SCAN_RATE;
     v.onended = () => this.end(true);
-    v.onpause = () => { if (this.ep && !this.ending && gen === this.gen) setTimeout(() => this.ep && gen === this.gen && v.play().catch(() => {}), 300); };
-    v.play().catch(() => {});
-    // Grab frames on a short timer (frame callbacks don't fire for a video nobody sees).
-    const poll = () => {
-      if (gen !== this.gen) return;
-      const t = v.currentTime;
+    v.onpause = () => { if (this.ep && !this.ending && !this.waiting && gen === this.gen) setTimeout(() => this.ep && gen === this.gen && v.play().catch(() => {}), 300); };
+    // Don't start until the scanner is ready and the jump has landed, or the first seconds get skipped.
+    this.waiting = true;
+    const go = () => { if (gen === this.gen && this.region && !v.seeking && v.readyState >= 2) { this.waiting = false; v.play().catch(() => {}); } };
+    this.go = go;
+    v.addEventListener('seeked', go, { once: true });
+    v.addEventListener('canplay', go, { once: true });
+    setTimeout(go, 1500); setTimeout(go, 4000); // safety nets
+    // Exact frames: requestVideoFrameCallback hands us each frame as it's shown, with its true
+    // media time, so subtitle timings are frame-accurate. A slow timer is only a fallback for when
+    // Chrome stops delivering frame callbacks (e.g. the tab is in the background).
+    let lastCb = 0;
+    const sample = (t) => {
       this.pos = t;
-      if (t >= this.to) return this.end(true);
+      if (t >= this.to) { this.end(true); return false; }
       if (this.region && !this.busy && v.readyState >= 2 && !v.seeking && t + 0.001 >= this.next) {
-        this.next = t + SAMPLE_INTERVAL;
+        this.next = t + SAMPLE_INTERVAL * 0.9;
         const r = this.region;
         this.ctx.drawImage(v, r.x0, r.y0, r.w, r.h, 0, 0, r.w, r.h);
         const data = this.ctx.getImageData(0, 0, r.w, r.h).data.buffer;
         this.busy = true;
         this.worker.postMessage({ type: 'frame', t, data }, [data]);
       }
-      setTimeout(poll, 12);
+      return true;
     };
-    setTimeout(poll, 12);
+    const onFrame = (now, meta) => {
+      if (gen !== this.gen) return;
+      lastCb = performance.now();
+      if (sample(meta.mediaTime)) v.requestVideoFrameCallback(onFrame);
+    };
+    v.requestVideoFrameCallback(onFrame);
+    const poll = () => {
+      if (gen !== this.gen) return;
+      if (performance.now() - lastCb > 500 && !sample(v.currentTime)) return;
+      setTimeout(poll, 40);
+    };
+    setTimeout(poll, 40);
   },
 
   onMessage(m) {
@@ -289,6 +325,7 @@ const Scan = {
       this.region = m;
       this.canvas = new OffscreenCanvas(m.w, m.h);
       this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
+      if (this.waiting && this.go) this.go();
     } else if (m.type === 'ack') this.busy = false;
     else if (m.type === 'progress' && ep) {
       this.safe = m.safe;
@@ -761,6 +798,7 @@ async function renderLibrary() {
           <button class="btn small" data-act="subs">Subtitles</button>
           ${ep.status === 'paused' ? '<button class="btn small" data-act="resume">Resume prep</button>' : ep.status === 'processing' && files.has(ep.id) ? '<button class="btn small" data-act="pause">Pause prep</button>' : ''}
           ${ep.status === 'processing' && !files.has(ep.id) ? '<button class="btn small" data-act="continue">Continue prep</button>' : ''}
+          ${(ep.scanVersion || 1) < SCANNER_VERSION ? '<button class="btn small" data-act="redo" title="Read this episode again with the improved, frame-accurate timing">Redo subtitles</button>' : ''}
           <button class="btn small ghost danger" data-act="delete" style="margin-left:auto">Delete</button>
         </div>
       </div>
@@ -779,6 +817,11 @@ $('#grid').addEventListener('click', async (e) => {
   if (act === 'pause') { ep.status = 'paused'; if (Scan.ep?.id === ep.id) Scan.stop(); saveEp(ep); libDirty = true; }
   if (act === 'resume') { ep.status = 'processing'; saveEp(ep); libDirty = true; tick(); }
   if (act === 'continue') { if (await ensureFile(ep)) { libDirty = true; tick(); } }
+  if (act === 'redo') {
+    if (!confirm(`Read "${ep.title}" again with the improved timing?\n\nIts current subtitles (and any edits) are replaced. With AI polish on this costs about the same as the first time (cents).`)) return;
+    await redoEpisode(ep.id);
+    if (!files.has(ep.id)) toast('Open the episode to start reading it again.');
+  }
   if (act === 'delete') {
     if (!confirm(`Delete "${ep.title}" and its subtitles?\n\nThe video file itself stays on your computer.`)) return;
     await deleteEpisode(ep.id);
@@ -988,55 +1031,57 @@ function layoutOverlay() {
 }
 new ResizeObserver(layoutOverlay).observe($('#stage'));
 
+// Subtitle timings are frame-accurate (±0.05 s), so the English appears and disappears with the Hebrew.
+const LEAD = 0.04, LAG = 0.04;
 function cueAt(t) {
   let lo = 0, hi = P.cues.length - 1, best = null;
-  while (lo <= hi) { const mid = (lo + hi) >> 1; if (P.cues[mid].start - 0.18 <= t) { best = mid; lo = mid + 1; } else hi = mid - 1; }
+  while (lo <= hi) { const mid = (lo + hi) >> 1; if (P.cues[mid].start - LEAD <= t) { best = mid; lo = mid + 1; } else hi = mid - 1; }
   for (let i = best; i != null && i >= 0 && i >= best - 2; i--) {
     const c = P.cues[i];
-    if (t >= c.start - 0.18 && t <= c.end + 0.12) return c;
+    if (t >= c.start - LEAD && t < c.end + LAG) return c;
   }
   return null;
 }
 
-// ---- consistent subtitle box ----
-// Standard boxes for the episode, learned from all detected lines: one size for one-line subtitles
-// and one for two-line subtitles, same width, same centre, same bottom edge. So the black backdrop
-// doesn't jump around from line to line. A line that reaches outside its standard box grows it just
-// enough to still cover the Hebrew; captions elsewhere (credits, name tags) get their own box.
+// ---- fixed subtitle box ----
+// One box per episode, always the same size and position: it covers the area where the burned-in
+// Hebrew subtitles sit (learned from all detected lines, wide and tall enough for two-line
+// subtitles). Lines shown elsewhere on screen (credits, name tags) get their own box.
 const pct = (arr, p) => { const a = arr.slice().sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.max(0, Math.floor(p * (a.length - 1))))]; };
+const DEFAULT_BAND = { cx: 0.5, w: 0.64, bottom: 0.955, h: 0.14 }; // typical TV subtitle area, until learned
 let bandTimer = null;
-function scheduleBand() { clearTimeout(bandTimer); bandTimer = setTimeout(() => { computeBand(); renderOverlay(true); }, 800); }
+function scheduleBand() { if (P.ep?.band?.final) return; clearTimeout(bandTimer); bandTimer = setTimeout(() => { computeBand(); renderOverlay(true); }, 800); }
 function computeBand() {
-  P.band = null;
+  const ep = P.ep;
+  if (!ep) return;
+  if (ep.band && ep.band.final) { P.band = ep.band; return; }
   const all = P.cues.filter((c) => c.bbox && c.hebrew);
-  if (all.length < 10) return;
-  const medBottom = pct(all.map((c) => c.bbox[1] + c.bbox[3]), 0.5);
+  const medBottom = all.length ? pct(all.map((c) => c.bbox[1] + c.bbox[3]), 0.5) : 0;
   const main = all.filter((c) => Math.abs(c.bbox[1] + c.bbox[3] - medBottom) < 0.05 && Math.abs(c.bbox[0] + c.bbox[2] / 2 - 0.5) < 0.15);
-  if (main.length < 8) return;
-  const lines = (c) => c.hebrew.split('\n').length;
-  const one = main.filter((c) => lines(c) === 1), two = main.filter((c) => lines(c) === 2);
-  const h1 = one.length >= 5 ? pct(one.map((c) => c.bbox[3]), 0.75) : 0.05;
-  const h2 = two.length >= 3 ? pct(two.map((c) => c.bbox[3]), 0.75) : h1 * 2.3;
-  P.band = {
-    cx: pct(main.map((c) => c.bbox[0] + c.bbox[2] / 2), 0.5),
-    w: pct(main.map((c) => c.bbox[2]), 0.8),
-    bottom: pct(main.map((c) => c.bbox[1] + c.bbox[3]), 0.75),
-    h1, h2: Math.max(h2, h1 * 1.6),
-  };
+  if (main.length < 12) { P.band = ep.band || DEFAULT_BAND; return; }
+  // Size it from ordinary one- and two-line subtitles only (multi-line credit blocks would bloat it).
+  const lineH = pct(main.filter((c) => c.hebrew.split('\n').length === 1).map((c) => c.bbox[3]), 0.5) || 0.045;
+  const normal = main.filter((c) => c.hebrew.split('\n').length <= 2 && c.bbox[3] < lineH * 3.2);
+  if (normal.length < 10) { P.band = ep.band || DEFAULT_BAND; return; }
+  const cx = pct(normal.map((c) => c.bbox[0] + c.bbox[2] / 2), 0.5);
+  const half = Math.max(cx - pct(normal.map((c) => c.bbox[0]), 0.05), pct(normal.map((c) => c.bbox[0] + c.bbox[2]), 0.95) - cx);
+  const bottom = pct(normal.map((c) => c.bbox[1] + c.bbox[3]), 0.9);
+  const twos = normal.filter((c) => c.bbox[3] > lineH * 1.6);
+  const top = twos.length >= 4 ? pct(twos.map((c) => c.bbox[1]), 0.1) : bottom - lineH * 2.4;
+  // Once enough lines are seen the box is fixed for good, so it never shifts while watching.
+  ep.band = { cx, w: Math.min(0.96, half * 2), bottom: Math.min(0.995, bottom), h: Math.max(0.06, bottom - top), final: normal.length >= 60 };
+  saveEp(ep);
+  P.band = ep.band;
 }
-// Box for a line as [x0, y0, x1, y1] in 0..1 video coordinates, plus whether it's a standard box.
+function inBand(c) {
+  const b = P.band, [bx, by, bw, bh] = c.bbox;
+  return !!b && Math.abs(by + bh - b.bottom) < 0.07 && bx + bw / 2 > b.cx - b.w / 2 && bx + bw / 2 < b.cx + b.w / 2;
+}
+const bandBox = () => { const b = P.band; return [b.cx - b.w / 2, b.bottom - b.h, b.cx + b.w / 2, b.bottom]; };
 function boxFor(c) {
+  if (inBand(c)) return { box: bandBox(), band: true };
   const [bx, by, bw, bh] = c.bbox;
-  const b = P.band;
-  const own = [bx, by, bx + bw, by + bh];
-  if (!b || Math.abs(by + bh - b.bottom) > 0.06 || Math.abs(bx + bw / 2 - b.cx) > 0.2) return { box: own, band: false };
-  // One-line or two-line standard box: by the text, or by the Hebrew's actual height on screen.
-  const twoLines = c.hebrew.split('\n').length >= 2 || by < b.bottom - b.h1 - 0.012;
-  const h = twoLines ? b.h2 : b.h1;
-  const std = [b.cx - b.w / 2, b.bottom - h, b.cx + b.w / 2, b.bottom];
-  // Small overshoots are already covered by the box's padding, so only grow for real ones.
-  const tx = 0.012, ty = 0.012;
-  return { box: [own[0] < std[0] - tx ? own[0] : std[0], own[1] < std[1] - ty ? own[1] : std[1], own[2] > std[2] + tx ? own[2] : std[2], own[3] > std[3] + ty ? own[3] : std[3]], band: true, std };
+  return { box: [bx, by, bx + bw, by + bh], band: false };
 }
 
 P.scale = Math.min(1.8, Math.max(0.6, Number(localStorage.getItem('subScale')) || 1));
@@ -1058,7 +1103,7 @@ function renderOverlay(force) {
   if (!c && P.band) {
     const next = P.cues.find((x) => x.start - 0.18 > t);
     const prev = [...P.cues].reverse().find((x) => x.end + 0.12 < t);
-    if (prev && next && next.start - prev.end < 0.7 && boxFor(prev).band && boxFor(next).band && prev.english && next.english) bridge = true;
+    if (prev && next && next.start - prev.end < 0.7 && inBand(prev) && inBand(next) && prev.english && next.english) bridge = true;
   }
   const key = c ? `${c.id}|${c.status}|${c.english}|${c.hebrew}|${mode}|${vrect.w}|${vrect.h}|${P.scale}|${JSON.stringify(P.band)}` : `none|${bridge}|${mode}|${P.scale}`;
   if (!force && key === shownKey) return;
@@ -1067,21 +1112,26 @@ function renderOverlay(force) {
   if ((c?.id || null) !== P.activeId) { P.activeId = c?.id || null; markActive(); }
   const font = Math.max(12, vrect.h * 0.043 * P.scale);
   const padX = font * 0.7, padY = font * 0.32;
-  const place = (box, text) => {
+  const place = (box, text, fixed) => {
     const [x0, y0, x1, y1] = box;
-    const width = (x1 - x0) * vrect.w + padX * 2;
-    const minH = (y1 - y0) * vrect.h + padY * 2;
+    const width = Math.min((x1 - x0) * vrect.w + padX * 2, vrect.w * 0.98);
+    const height = (y1 - y0) * vrect.h + padY * 2;
     const left = ((x0 + x1) / 2) * vrect.w;
-    const bottom = vrect.h - y1 * vrect.h - padY;
-    return `<div class="sub-box" style="left:${left}px;bottom:${bottom}px;width:${Math.min(width, vrect.w * 0.96)}px;min-height:${minH}px;font-size:${font}px">${text}</div>`;
+    const bottom = Math.max(0, vrect.h - y1 * vrect.h - padY);
+    return `<div class="sub-box${fixed ? ' fixed' : ''}" style="left:${left}px;bottom:${bottom}px;width:${width}px;${fixed ? 'height' : 'min-height'}:${height}px;font-size:${font}px">${text}</div>`;
   };
-  if (!c && bridge && mode !== 'off') { const b = P.band; ov.innerHTML = place([b.cx - b.w / 2, b.bottom - b.h1, b.cx + b.w / 2, b.bottom], ''); return; }
+  if (!c && bridge && mode !== 'off') { ov.innerHTML = place(bandBox(), '', true); return; }
   if (!c || mode === 'off' || (mode === 'he' ? !c.hebrew : !c.english)) { ov.innerHTML = ''; return; }
   let html;
   if (mode === 'en') html = `<div>${esc(c.english)}</div>`;
   else if (mode === 'he') html = `<div class="he">${esc(c.hebrew)}</div>`;
   else html = `<div>${esc(c.english)}</div><div class="he small">${esc(c.hebrew)}</div>`;
-  ov.innerHTML = place(boxFor(c).box, html);
+  const { box, band } = boxFor(c);
+  ov.innerHTML = place(box, html, band);
+  // Fixed box: a very long line shrinks a little to fit instead of growing the box.
+  const el = ov.firstChild;
+  let f = font;
+  while (band && el.scrollHeight > el.clientHeight + 1 && f > font * 0.7) { f *= 0.93; el.style.fontSize = f + 'px'; }
 }
 
 function loop() {
