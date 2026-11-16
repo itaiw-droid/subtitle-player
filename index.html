@@ -64,7 +64,7 @@ input, textarea { font: inherit; color: inherit; }
 
 /* ---------- Dialog ---------- */
 .scrim { position: fixed; inset: 0; background: rgba(0,0,0,.66); display: grid; place-items: center; z-index: 50; padding: 20px; }
-.dialog { width: min(560px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 26px; box-shadow: 0 30px 80px rgba(0,0,0,.6); }
+.dialog { max-height: calc(100vh - 40px); overflow-y: auto; width: min(560px, 100%); background: var(--panel); border: 1px solid var(--line); border-radius: 18px; padding: 26px; box-shadow: 0 30px 80px rgba(0,0,0,.6); }
 .dialog h2 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
 .dialog .sub { color: var(--muted); font-size: 14px; margin: 0 0 20px; line-height: 1.5; }
 .drop { border: 1.5px dashed #33333b; border-radius: 14px; padding: 22px; text-align: center; color: var(--muted); font-size: 14px; }
@@ -72,6 +72,7 @@ input, textarea { font: inherit; color: inherit; }
 .chosen { display: flex; align-items: center; gap: 12px; background: var(--panel2); border-radius: 12px; padding: 12px 14px; font-size: 14px; }
 .chosen .name { flex: 1; word-break: break-all; }
 label.field { display: block; margin-top: 16px; font-size: 13px; color: var(--muted); }
+label.field select { display: block; width: 100%; margin-top: 6px; background: #0e0e11; border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px; font-size: 13.5px; color: var(--text); }
 label.field input, label.field textarea { display: block; width: 100%; margin-top: 6px; background: #0e0e11; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; font-size: 14px; resize: vertical; }
 label.field input:focus, label.field textarea:focus { outline: none; border-color: #4a4a54; }
 .modes { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 22px; }
@@ -280,8 +281,22 @@ details.owner summary { cursor: pointer; color: var(--muted); font-size: 13.5px;
       <summary>Site owner</summary>
       <p class="sub" style="margin:10px 0">Turn AI on or off for everyone who uses this site.</p>
       <label class="field" style="margin-top:0">Owner passcode<input id="owner-token" type="password" autocomplete="off"></label>
-      <div style="display:flex;gap:8px;margin-top:10px"><button class="btn small primary" id="owner-on">Turn on for everyone</button><button class="btn small" id="owner-off">Turn off for everyone</button></div>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap"><button class="btn small primary" id="owner-on">Turn on for everyone</button><button class="btn small" id="owner-off">Turn off for everyone</button><button class="btn small ghost" id="owner-load">Spending &amp; tuning</button></div>
       <div id="owner-msg" class="sub" style="margin:10px 0 0"></div>
+      <div id="owner-tune" class="hidden">
+        <div id="owner-usage" class="sub" style="margin:14px 0 6px;color:var(--text)"></div>
+        <label class="field">Hard-to-read lines are read from the picture by
+          <select id="t-image"><option value="haiku">Claude Haiku — cheapest, recommended</option><option value="sonnet">Claude Sonnet — best with slang, ~20× the cost for these lines</option><option value="off">Nobody — text only (cheapest, weaker on messy lines)</option></select>
+        </label>
+        <label class="field">Read a line from the picture when the OCR is less sure than
+          <select id="t-thr"><option value="0">Never (only lines Claude flags)</option><option value="0.75">75% — fewer pictures, cheaper</option><option value="0.85">85% — recommended</option><option value="0.95">95% — more pictures</option><option value="1.01">Always — every line from the picture (~$0.06/episode)</option></select>
+        </label>
+        <label class="field">Extra thinking for text lines
+          <select id="t-think"><option value="off">Off — cheapest, recommended</option><option value="on">On — about 2× the text cost</option></select>
+        </label>
+        <div style="margin-top:12px"><button class="btn small primary" id="t-save">Save tuning</button></div>
+        <p class="sub" style="margin:10px 0 0;font-size:12.5px">Measured on a real episode: recommended settings ≈ $0.05 per episode with Claude Haiku.</p>
+      </div>
     </details>
     <div class="dialog-foot"><button class="btn ghost" id="ai-close">Close</button></div>
   </div>

@@ -560,7 +560,8 @@ async function translatePump() {
 // Optional AI polish — Claude via the owner's private relay (key never in this page)
 // =====================================================================
 const RELAY_URL = 'https://subtitle-player-relay.subtitle-player.workers.dev';
-const AI = { reachable: false, enabled: false, configured: false, remaining: 0, viewerOn: localStorage.getItem('aiOff') !== '1', backoffUntil: 0, busy: false, lastError: '' };
+const AI = { reachable: false, enabled: false, configured: false, remaining: 0, viewerOn: localStorage.getItem('aiOff') !== '1', backoffUntil: 0, busy: false, lastError: '', spent: 0,
+  settings: { imageModel: 'haiku', threshold: 0.85, think: 'off' } };
 const relayConfigured = () => /^https:/.test(RELAY_URL);
 const aiActive = () => relayConfigured() && AI.reachable && AI.enabled && AI.configured && AI.viewerOn && AI.remaining > 0 && Date.now() > AI.backoffUntil;
 
@@ -577,7 +578,8 @@ async function aiStatus() {
   try {
     const r = await fetch(RELAY_URL + '/status', { cache: 'no-store' });
     const j = await r.json();
-    AI.reachable = r.ok; AI.enabled = !!j.enabled; AI.configured = !!j.configured; AI.remaining = j.remaining || 0;
+    AI.reachable = r.ok; AI.enabled = !!j.enabled; AI.configured = !!j.configured; AI.remaining = j.remaining ?? 1e9;
+    if (j.settings) AI.settings = { ...AI.settings, ...j.settings };
   } catch { AI.reachable = false; }
   updateAiUi();
   aiPump();
@@ -604,8 +606,14 @@ function aiFailed(e) {
   translatePump();
 }
 
-// Next batch for Claude: new lines first (the viewer's next ones before anything else), then
-// background upgrades of lines the offline translator already did, away from the playhead.
+// How each line gets polished (owner-tunable on the relay, see the AI panel):
+//  • clean OCR lines → fixed + translated from the text in batches (cheapest)
+//  • messy OCR lines (low confidence), or lines Claude flags as unsure → read from the subtitle picture
+const needsPicture = (c) => AI.settings.imageModel !== 'off' && (c.forcePicture || (c.confidence ?? 1) < AI.settings.threshold);
+const TEXT_BATCH = 30, IMAGE_BATCH = 12;
+
+// Next batch for Claude: the viewer's next lines first, then background upgrades of lines the
+// offline translator already did (away from the playhead). Lines of one kind (text / picture) per batch.
 function pickAiBatch() {
   let best = null;
   for (const ep of episodes.values()) {
@@ -616,25 +624,41 @@ function pickAiBatch() {
       if (!best || pr < best.pr) best = { ep, c, pr };
     }
   }
-  const take = (ep, head, ok, max) => {
+  const take = (ep, head, ok) => {
     const cues = cuesById.get(ep.id);
+    const kind = needsPicture(head) ? 'image' : 'text';
+    const max = kind === 'image' ? IMAGE_BATCH : TEXT_BATCH;
     const batch = [];
-    for (let i = cues.indexOf(head); i < cues.length && batch.length < max; i++) {
-      if (ok(cues[i])) batch.push(cues[i]); else if (batch.length) break;
+    const i0 = cues.indexOf(head);
+    for (let i = i0; i < cues.length && batch.length < max && i < i0 + max * 3; i++) {
+      const c = cues[i];
+      if (ok(c) && (needsPicture(c) ? 'image' : 'text') === kind) batch.push(c);
     }
-    return { ep, batch };
+    return { ep, batch, kind };
   };
-  if (best) return take(best.ep, best.c, (c) => c.status === 'hebrew' && !c.aiBusy, 14);
+  if (best) return take(best.ep, best.c, (c) => c.status === 'hebrew' && !c.aiBusy);
   const upgradable = (ep, c) => c.status === 'done' && c.source !== 'ai' && !c.edited && !c.aiTried && !c.aiBusy && c.hebrew &&
     !(watch.id === ep.id && c.end > watch.t - 2 && c.start < watch.t + 25);
   for (const ep of episodes.values()) {
     if (ep.status === 'paused') continue;
     const cues = cuesById.get(ep.id) || [];
     const head = cues.find((c) => upgradable(ep, c));
-    if (head) return take(ep, head, (c) => upgradable(ep, c), 14);
+    if (head) return take(ep, head, (c) => upgradable(ep, c));
   }
   return null;
 }
+
+function contextFor(ep, batch) {
+  const cues = cuesById.get(ep.id);
+  const i0 = cues.indexOf(batch[0]), i1 = cues.indexOf(batch[batch.length - 1]);
+  return {
+    show: ep.show,
+    before: cues.slice(Math.max(0, i0 - 6), i0).filter((c) => c.english).map((c) => ({ he: c.hebrew, en: c.english })),
+    after: cues.slice(i1 + 1, i1 + 4).filter((c) => c.hebrew).map((c) => c.hebrew),
+  };
+}
+
+const toB64 = (blob) => new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(String(r.result).split(',')[1]); r.readAsDataURL(blob); });
 
 async function aiPump() {
   if (AI.busy || !aiActive()) return;
@@ -643,69 +667,56 @@ async function aiPump() {
     while (aiActive()) {
       const job = pickAiBatch();
       if (!job || !job.batch.length) break;
-      const { ep, batch } = job;
+      const { ep, batch, kind } = job;
       const cues = cuesById.get(ep.id);
       for (const c of batch) { c.aiBusy = true; if (c.status === 'hebrew') c.status = 'ai'; }
       changed(ep, batch);
-      const i0 = cues.indexOf(batch[0]), i1 = cues.indexOf(batch[batch.length - 1]);
-      const before = cues.slice(Math.max(0, i0 - 8), i0).filter((c) => c.english).map((c) => ({ he: c.hebrew, en: c.english }));
-      const after = cues.slice(i1 + 1, i1 + 4).filter((c) => c.hebrew).map((c) => c.hebrew);
       const sent = batch.map((c) => c.hebrew);
+      const body = contextFor(ep, batch);
       let res;
       try {
-        res = await relay('/polish', { show: ep.show, before, after, lines: batch.map((c, k) => ({ n: k + 1, he: c.hebrew })) });
+        if (kind === 'image') {
+          body.lines = [];
+          for (const [k, c] of batch.entries()) {
+            const blob = await DB.get('blobs', `${ep.id}/${c.id}`);
+            body.lines.push({ n: k + 1, he: c.hebrew, img: blob ? await toB64(blob) : '' });
+          }
+          body.lines = body.lines.filter((l) => l.img);
+          res = await relay('/read', body);
+        } else {
+          body.lines = batch.map((c, k) => ({ n: k + 1, he: c.hebrew }));
+          res = await relay('/polish', body);
+        }
       } catch (e) {
         for (const c of batch) { delete c.aiBusy; if (c.status === 'ai') c.status = 'hebrew'; }
         changed(ep, batch);
         aiFailed(e);
         break;
       }
-      const unsure = [];
+      if (res.usage) AI.spent += res.usage.cost;
+      const removed = [];
       batch.forEach((c, k) => {
         delete c.aiBusy;
-        c.aiTried = true;
         const it = (res.items || []).find((x) => x.n === k + 1);
-        if (!it || c.hebrew !== sent[k]) { if (c.status === 'ai') c.status = 'hebrew'; return; } // missing, or edited meanwhile
-        if (!c.edited && aiText(it.hebrew)) c.hebrew = aiText(it.hebrew);
-        c.english = rewrap(aiText(it.english), c.hebrew);
-        c.status = 'done'; c.source = 'ai'; c.urgent = false; c.error = null;
+        if (!it || c.hebrew !== sent[k] || !cues.includes(c)) { if (c.status === 'ai') c.status = 'hebrew'; c.aiTried = true; return; }
+        if (kind === 'image' && it.not_text && !c.edited) { cues.splice(cues.indexOf(c), 1); removed.push(c.id); return; }
+        if (kind === 'text' && it.unsure && !c.edited && AI.settings.imageModel !== 'off' && !c.forcePicture) {
+          // Claude can't tell from the text: read it from the picture next.
+          c.forcePicture = true; if (c.status === 'ai') c.status = 'hebrew'; return;
+        }
+        const he = aiText(it.hebrew), en = aiText(it.english);
+        if (!c.edited && he) c.hebrew = he;
+        else if (!c.edited && !he && en) c.hebrew = en; // non-Hebrew on screen (e.g. English song lyrics)
+        c.english = rewrap(en, c.hebrew);
+        c.status = 'done'; c.source = 'ai'; c.urgent = false; c.error = null; c.aiTried = true;
         if (!c.edited) c.confidence = Math.max(c.confidence ?? 0, it.unsure ? 0.5 : 0.9);
-        if (it.unsure && !c.edited) unsure.push(c);
       });
       const gone = mergeSame(ep, cues);
       saveCues(ep.id);
       const touched = cues.filter((x) => x._touched); touched.forEach((x) => delete x._touched);
-      changed(ep, batch.filter((c) => !gone.includes(c)).concat(touched), gone.map((x) => x.id));
-      if (unsure.length) await aiRead(ep, unsure);
+      changed(ep, batch.filter((c) => cues.includes(c)).concat(touched), removed.concat(gone.map((x) => x.id)));
     }
   } finally { AI.busy = false; }
-}
-
-// Lines Claude couldn't make sense of from OCR text: let it read them from the picture.
-async function aiRead(ep, list) {
-  const toB64 = (blob) => new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(String(r.result).split(',')[1]); r.readAsDataURL(blob); });
-  for (let i = 0; i < list.length && aiActive(); i += 8) {
-    const part = list.slice(i, i + 8);
-    const lines = [];
-    for (const [k, c] of part.entries()) {
-      const blob = await DB.get('blobs', `${ep.id}/${c.id}`);
-      if (blob) lines.push({ n: k + 1, he: c.hebrew, img: await toB64(blob) });
-    }
-    if (!lines.length) continue;
-    const cues = cuesById.get(ep.id);
-    let res;
-    try { res = await relay('/read', { show: ep.show, lines }); } catch (e) { aiFailed(e); return; }
-    const removed = [], updated = [];
-    part.forEach((c, k) => {
-      const it = (res.items || []).find((x) => x.n === k + 1);
-      if (!it || !cues.includes(c) || c.edited) return;
-      if (it.not_text) { cues.splice(cues.indexOf(c), 1); removed.push(c.id); return; }
-      c.hebrew = aiText(it.hebrew) || c.hebrew; c.english = rewrap(aiText(it.english), c.hebrew); c.confidence = 0.9;
-      updated.push(c);
-    });
-    saveCues(ep.id);
-    changed(ep, updated, removed);
-  }
 }
 
 // =====================================================================
@@ -1227,9 +1238,8 @@ function updateAiUi() {
   else if (!AI.reachable) { text = 'Can\'t reach the AI service right now — using the offline method.'; dot = 'bad'; }
   else if (!AI.configured) { text = 'The AI service has no Claude key yet.'; dot = 'bad'; }
   else if (!AI.enabled) { text = 'Turned off by the site owner — using the offline method.'; dot = ''; }
-  else if (AI.remaining <= 0) { text = 'Today\'s AI allowance is used up — using the offline method until tomorrow.'; dot = ''; }
   else if (Date.now() < AI.backoffUntil) { text = `Paused for a few minutes (${AI.lastError}) — using the offline method meanwhile.`; dot = 'busy'; }
-  else { text = `Available · ${AI.remaining} requests left today.`; dot = 'ok'; }
+  else { text = 'Available — Claude fixes and translates the subtitles.'; dot = 'ok'; }
   s.innerHTML = `<span class="dot ${dot}"></span>${esc(text)}`;
   $('#ai-viewer').checked = AI.viewerOn;
   btn.classList.toggle('on', aiActive());
@@ -1245,21 +1255,39 @@ $('#ai-viewer').onchange = (e) => {
   updateAiUi();
   if (aiActive()) aiPump(); else translatePump();
 };
-async function ownerSet(enabled) {
+async function ownerCall(extra) {
   const token = $('#owner-token').value.trim();
   const msg = $('#owner-msg');
-  if (!relayConfigured()) { msg.textContent = 'The AI service isn\'t set up yet.'; return; }
+  if (!relayConfigured()) { msg.textContent = 'The AI service isn\'t set up yet.'; return null; }
   try {
-    const r = await fetch(RELAY_URL + '/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, enabled }) });
+    const r = await fetch(RELAY_URL + '/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, ...extra }) });
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || 'Failed');
     localStorage.setItem('aiOwnerToken', token);
-    msg.textContent = enabled ? 'AI is now ON for everyone.' : 'AI is now OFF for everyone.';
+    showOwner(j);
     aiStatus();
-  } catch (e) { msg.textContent = e.message; }
+    return j;
+  } catch (e) { msg.textContent = e.message; return null; }
 }
-$('#owner-on').onclick = () => ownerSet(true);
-$('#owner-off').onclick = () => ownerSet(false);
+const usd = (v) => (v < 0.01 && v > 0 ? '< $0.01' : '$' + v.toFixed(2));
+function showOwner(j) {
+  $('#owner-tune').classList.remove('hidden');
+  const u = j.usage || {};
+  const t = u.today || { cost: 0, lines: 0 }, m = u.last30 || { cost: 0, lines: 0 };
+  $('#owner-usage').innerHTML = `AI is <b>${j.enabled ? 'ON' : 'OFF'}</b> for everyone.<br>Spent today: <b>${usd(t.cost)}</b> (${t.lines} lines) · Last 30 days: <b>${usd(m.cost)}</b> (${m.lines} lines)` +
+    (m.lines ? `<br>Average: ${usd(m.cost / m.lines * 900)} per ~900-line episode` : '');
+  const s = j.settings || AI.settings;
+  $('#t-image').value = s.imageModel;
+  $('#t-thr').value = String([0, 0.75, 0.85, 0.95, 1.01].reduce((a, b) => (Math.abs(b - s.threshold) < Math.abs(a - s.threshold) ? b : a)));
+  $('#t-think').value = s.think;
+}
+$('#owner-on').onclick = async () => { if (await ownerCall({ enabled: true })) $('#owner-msg').textContent = 'AI is now ON for everyone.'; };
+$('#owner-off').onclick = async () => { if (await ownerCall({ enabled: false })) $('#owner-msg').textContent = 'AI is now OFF for everyone.'; };
+$('#owner-load').onclick = async () => { if (await ownerCall({})) $('#owner-msg').textContent = ''; };
+$('#t-save').onclick = async () => {
+  const settings = { imageModel: $('#t-image').value, threshold: Number($('#t-thr').value), think: $('#t-think').value };
+  if (await ownerCall({ settings })) $('#owner-msg').textContent = 'Saved. New lines use these settings.';
+};
 
 // =====================================================================
 // Routing & start-up

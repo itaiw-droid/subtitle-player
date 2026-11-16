@@ -5,7 +5,6 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 ALLOWED_ORIGINS = "https://itaiw-droid.github.io"
-DAILY_LIMIT = "400"
 
 # Filled in by `wrangler kv namespace create SETTINGS`
 [[kv_namespaces]]

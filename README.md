@@ -22,12 +22,15 @@ is re-translated; or edit the English directly.
 
 ## Optional AI polish (Claude)
 
-The **AI polish** button turns on Claude for better accuracy: Claude Haiku fixes OCR mistakes and translates
-with the surrounding lines for context; lines it can't make sense of are read from a small snapshot by
-Claude Sonnet. Only subtitle text and those snapshots are sent — never the video.
+The **AI polish** button turns on Claude for better accuracy. Clean OCR lines are fixed and translated from
+the text by Claude Haiku in batches with the surrounding lines for context; messy lines (low OCR confidence,
+or ones Claude can't make sense of) are read from a small snapshot of the subtitle. Measured on a real
+episode this costs about $0.05 per episode. Only subtitle text and those snapshots are sent — never the video.
+The owner can see spending and tune the trade-offs (picture-reading model, confidence threshold, thinking)
+in the AI polish panel.
 
 Calls go through a small relay (`relay/`, a Cloudflare Worker) that holds the API key, only answers this
-site, and enforces a daily limit. The site owner turns AI on/off for everyone from the AI polish panel
+site, and records token usage and cost. The site owner turns AI on/off for everyone from the AI polish panel
 (owner passcode); each viewer can also turn it off for themselves. When AI is off or unavailable, the
 free offline method below is used automatically.
 
