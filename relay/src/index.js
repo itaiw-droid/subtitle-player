@@ -83,7 +83,7 @@ const READ_SCHEMA = {
 function cors(origin, allowed) {
   return {
     'Access-Control-Allow-Origin': allowed ? origin : 'null',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
@@ -217,6 +217,25 @@ export default {
     const settings = await getSettings(env);
 
     if (url.pathname === '/status') return reply({ enabled, configured: !!env.ANTHROPIC_API_KEY, settings, remaining: 1e9 }); // no daily cap
+
+    // Shared subtitles: finished subtitles for a video, keyed by a fingerprint of the file (never the
+    // video itself). Lets anyone who opens the same file skip processing and AI cost.
+    const shared = url.pathname.match(/^\/shared\/([a-f0-9]{64})$/);
+    if (shared && req.method === 'GET') {
+      const v = await env.SETTINGS.get('shared:' + shared[1]);
+      return v ? new Response(v, { status: 200, headers }) : reply({ error: 'Not found' }, 404);
+    }
+    if (shared && req.method === 'PUT') {
+      const text = await req.text();
+      if (text.length > 20e6) return reply({ error: 'Too large' }, 413);
+      let body;
+      try { body = JSON.parse(text); } catch { return reply({ error: 'Bad JSON' }, 400); }
+      const cues = Array.isArray(body.cues) ? body.cues : [];
+      const ok = cues.length > 0 && cues.every((c) => Number.isFinite(c.start) && Number.isFinite(c.end) && Array.isArray(c.bbox) && typeof c.english === 'string');
+      if (!ok || !body.meta || !Number.isFinite(body.meta.duration)) return reply({ error: 'Bad subtitles' }, 400);
+      await env.SETTINGS.put('shared:' + shared[1], JSON.stringify({ meta: body.meta, cues, savedAt: Date.now() }));
+      return reply({ ok: true, lines: cues.length });
+    }
 
     if (url.pathname === '/admin' && req.method === 'POST') {
       const body = await req.json().catch(() => ({}));

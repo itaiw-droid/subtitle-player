@@ -40,6 +40,15 @@ site, and records token usage and cost. The site owner turns AI on/off for every
 (owner passcode); each viewer can also turn it off for themselves. When AI is off or unavailable, the
 free offline method below is used automatically.
 
+## Fast preparation and shared subtitles
+
+- **Fast preparation:** for MP4/MOV files the app reads the compressed frames straight from the file and
+  decodes them with Chrome's video decoder in a background worker — roughly 10–20× real time, and it keeps
+  going while the tab is in the background. Other formats use the slower playback-based scanner.
+- **Shared subtitles:** once an episode is fully prepared with AI polish, its finished subtitles are stored
+  on the relay under a fingerprint of the video file (size + three small samples — never the video). Anyone
+  who opens the same file gets them instantly: no processing, no AI cost. Edits are shared too.
+
 ## How it works
 
 - `scan-worker.js` looks at the bottom of the frame while a hidden copy of the video plays fast-forward,
@@ -52,4 +61,5 @@ free offline method below is used automatically.
 Notes: processing runs only while the tab is open and visible. After the page is closed, Chrome asks
 once for permission to read the video file again (or you pick it again).
 
-Third-party: tesseract.js and tesseract.js-core (Apache-2.0), Hebrew traineddata from tessdata (Apache-2.0).
+Third-party: tesseract.js and tesseract.js-core (Apache-2.0), Hebrew traineddata from tessdata (Apache-2.0),
+mp4box.js (BSD-3-Clause).

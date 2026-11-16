@@ -4,7 +4,6 @@
 //   • a colour crop (shown in the subtitle list)
 //   • a clean black-on-white image of just the lettering (for OCR), built from the per-pixel
 //     minimum over all frames of that subtitle — the letters stay white, a moving background doesn't.
-'use strict';
 
 const RX0 = 0.06, RX1 = 0.94, RY0 = 0.58, RY1 = 0.985;
 const MIN_PIXELS = 60;
@@ -377,19 +376,151 @@ function onFrame(t, d) {
   }
 }
 
+// ---------------------------------------------------------------- fast path: WebCodecs
+// Reads the MP4/MOV frame index once, then feeds the compressed frames straight from the file to
+// Chrome's hardware decoder. Much faster than real-time playback, frame-exact, and it keeps going
+// when the tab is in the background (it all runs in this worker).
+let MP4 = null;
+async function mp4box() { return (MP4 ||= await import('./vendor/mp4box/mp4box.all.mjs')); }
+
+// src: { file } (the user's File) or { url, size } (testing). Returns an ArrayBuffer of [off, off+len).
+function reader(src) {
+  if (src.file) return (off, len) => src.file.slice(off, off + len).arrayBuffer();
+  return async (off, len) => (await fetch(src.url, { headers: { Range: `bytes=${off}-${off + len - 1}` } })).arrayBuffer();
+}
+
+const indexCache = new Map();
+async function openIndex(src) {
+  const key = src.file ? `${src.file.name}|${src.file.size}|${src.file.lastModified}` : src.url;
+  if (indexCache.has(key)) return indexCache.get(key);
+  const { createFile, MP4BoxBuffer, DataStream, Endianness } = await mp4box();
+  const read = reader(src);
+  const size = src.file ? src.file.size : src.size;
+  // Find the top-level boxes without reading the (huge) media data.
+  const boxes = [];
+  for (let off = 0; off < size;) {
+    const h = new DataView(await read(off, 16));
+    let s = h.getUint32(0);
+    const type = String.fromCharCode(h.getUint8(4), h.getUint8(5), h.getUint8(6), h.getUint8(7));
+    if (s === 1) s = Number(h.getBigUint64(8));
+    if (s === 0) s = size - off;
+    if (s < 8) break;
+    boxes.push({ type, off, s });
+    off += s;
+  }
+  const moov = boxes.find((b) => b.type === 'moov');
+  if (!moov) throw new Error('no moov');
+  const f = createFile();
+  let info = null;
+  f.onReady = (i) => { info = i; };
+  // Feed ftyp + moov as if they were back to back: the parser reads sequentially, and the moov is
+  // often after the media data (exported / camera files). Frame offsets come from the moov's own
+  // tables, so they still point at the right bytes in the real file.
+  let pos = 0;
+  for (const b of boxes.filter((x) => x.type === 'ftyp').concat([moov])) { f.appendBuffer(MP4BoxBuffer.fromArrayBuffer(await read(b.off, b.s), pos)); pos += b.s; }
+  f.flush();
+  const vt = info && info.videoTracks[0];
+  if (!vt) throw new Error('no video track');
+  const trak = f.getTrackById(vt.id);
+  const entry = trak.mdia.minf.stbl.stsd.entries[0];
+  const box = entry.avcC || entry.hvcC || entry.vpcC || entry.av1C;
+  let description;
+  if (box) { const ds = new DataStream(undefined, 0, Endianness.BIG_ENDIAN); box.write(ds); description = new Uint8Array(ds.buffer, 8); }
+  // Edit list: the player's time 0 is this media time (usually the B-frame delay).
+  const elst = trak.edts && trak.edts.elst && trak.edts.elst.entries && trak.edts.elst.entries.find((e) => e.media_time >= 0);
+  const shift = elst ? elst.media_time : 0;
+  const samples = f.getTrackSamplesInfo(vt.id).map((x) => ({ offset: x.offset, size: x.size, cts: x.cts - shift, dur: x.duration, key: !!x.is_sync }));
+  const idx = { codec: vt.codec, width: vt.video.width, height: vt.video.height, timescale: vt.timescale, description, samples };
+  indexCache.set(key, idx);
+  return idx;
+}
+
+let job = null;
+async function decodeScan(m) {
+  const my = { stopped: false, done: null };
+  job = my;
+  let resolveDone;
+  my.done = new Promise((r) => { resolveDone = r; });
+  try {
+    const idx = await openIndex(m.src);
+    const config = { codec: idx.codec, codedWidth: idx.width, codedHeight: idx.height, hardwareAcceleration: 'prefer-hardware' };
+    if (idx.description) config.description = idx.description;
+    const support = await VideoDecoder.isConfigSupported(config).catch(() => ({ supported: false }));
+    if (!support.supported) { post({ type: 'fast-unsupported', reason: idx.codec }); return; }
+    const ts = idx.timescale, samples = idx.samples;
+    const from = m.from, to = m.to;
+    // Start at the last keyframe at or before `from` (decode order = file order).
+    let start = 0;
+    for (let i = 0; i < samples.length; i++) { if (samples[i].key && samples[i].cts / ts <= from + 0.001) start = i; if (samples[i].cts / ts > from + 5) break; }
+    const canvas = new OffscreenCanvas(rw, rh);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    let next = from, reachedEnd = false, failed = null;
+    const decoder = new VideoDecoder({
+      output: (frame) => {
+        const t = frame.timestamp / 1e6;
+        if (!my.stopped && t >= from - 0.001 && t < to && t + 0.001 >= next) {
+          next = t + interval * 0.9;
+          ctx.drawImage(frame, rx0, ry0, rw, rh, 0, 0, rw, rh);
+          onFrame(t, ctx.getImageData(0, 0, rw, rh).data);
+        }
+        if (t >= to) reachedEnd = true;
+        frame.close();
+      },
+      error: (e) => { failed = e; },
+    });
+    decoder.configure(config);
+    const read = reader(m.src);
+    let i = start;
+    while (i < samples.length && !my.stopped && !failed && !reachedEnd) {
+      // Read a run of consecutive frames in one go (they sit back to back in the file).
+      let j = i, bytes = 0;
+      while (j < samples.length && bytes < 4e6 && (j === i || samples[j].offset === samples[j - 1].offset + samples[j - 1].size)) { bytes += samples[j].size; j++; }
+      const buf = await read(samples[i].offset, bytes);
+      let pos = 0;
+      for (let k = i; k < j && !my.stopped; k++) {
+        const smp = samples[k];
+        while (decoder.decodeQueueSize > 24 && !my.stopped) await new Promise((r) => decoder.addEventListener('dequeue', r, { once: true }));
+        decoder.decode(new EncodedVideoChunk({ type: smp.key ? 'key' : 'delta', timestamp: Math.round(smp.cts / ts * 1e6), duration: Math.round(smp.dur / ts * 1e6), data: new Uint8Array(buf, pos, smp.size) }));
+        pos += smp.size;
+        // Past the end of the range (plus a little for reordered frames): stop feeding.
+        if (smp.key && smp.cts / ts > to + 1) { reachedEnd = true; break; }
+      }
+      i = j;
+    }
+    if (!my.stopped && !failed) await decoder.flush().catch(() => {});
+    try { decoder.close(); } catch { /* already closed */ }
+    if (failed && !my.stopped) { post({ type: 'fast-unsupported', reason: String(failed.message || failed) }); return; }
+    if (!my.stopped) post({ type: 'fast-done', t: Math.min(to, samples.length ? samples[samples.length - 1].cts / ts : to) });
+  } catch (e) {
+    if (!my.stopped) post({ type: 'fast-unsupported', reason: String(e.message || e) });
+  } finally {
+    resolveDone();
+    if (job === my) job = null;
+  }
+}
+
+function setup(m) {
+  gen = m.gen; W = m.W; H = m.H; interval = m.interval || 1 / 6;
+  const r = region(W, H);
+  rx0 = r.x0; ry0 = r.y0; rw = r.w; rh = r.h;
+  step = Math.max(1, Math.floor(W / 640));
+  current = null; pending = null; lastProgress = -1; lastT = null; rangeStart = m.from;
+}
+
 onmessage = async (e) => {
   const m = e.data;
   if (m.type === 'start') {
-    gen = m.gen; W = m.W; H = m.H; interval = m.interval || 1 / 6;
-    const r = region(W, H);
-    rx0 = r.x0; ry0 = r.y0; rw = r.w; rh = r.h;
-    step = Math.max(1, Math.floor(W / 640));
-    current = null; pending = null; lastProgress = -1; lastT = null; rangeStart = m.from;
+    setup(m);
     post({ type: 'region', x0: rx0, y0: ry0, w: rw, h: rh });
+  } else if (m.type === 'decode') {
+    if (job) { job.stopped = true; await job.done; }
+    setup(m);
+    decodeScan(m);
   } else if (m.type === 'frame') {
     onFrame(m.t, new Uint8ClampedArray(m.data));
     post({ type: 'ack' });
   } else if (m.type === 'end') {
+    if (job) { job.stopped = true; await job.done; }
     // Range finished (or stopped): emit what's on screen as a partial subtitle.
     if (current && m.flush) await finish(current, Math.min(current.lastT + interval, m.t), true);
     current = null; pending = null;

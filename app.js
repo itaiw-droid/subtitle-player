@@ -128,6 +128,7 @@ function updateStatus(ep) {
   const complete = firstUncovered(ep.coverage, 0, ep.duration) == null && prog.pending === 0 && !(Scan.ep && Scan.ep.id === ep.id);
   const status = ep.status === 'paused' ? 'paused' : complete ? 'ready' : 'processing';
   if (status !== ep.status) { ep.status = status; saveEp(ep); }
+  if (status === 'ready' && ep.shared !== 'shared' && ep.shared !== 'imported') maybeShare(ep);
 }
 
 // UI hooks (filled in below)
@@ -202,6 +203,62 @@ function probe(file) {
 // =====================================================================
 // Episodes
 // =====================================================================
+// Fingerprint of a video file (size + three 1 MB samples). The same file on another computer gives
+// the same fingerprint, so finished subtitles can be shared without ever sharing the video.
+async function fingerprint(file) {
+  const MB = 1 << 20;
+  const parts = [new TextEncoder().encode(String(file.size)).buffer];
+  for (const at of [0, Math.max(0, Math.floor(file.size / 2) - MB / 2), Math.max(0, file.size - MB)]) parts.push(await file.slice(at, at + MB).arrayBuffer());
+  const all = new Uint8Array(parts.reduce((n, p) => n + p.byteLength, 0));
+  let o = 0;
+  for (const p of parts) { all.set(new Uint8Array(p), o); o += p.byteLength; }
+  return [...new Uint8Array(await crypto.subtle.digest('SHA-256', all))].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+// Ready subtitles for this exact file prepared by someone else? Then use them: no processing, no AI cost.
+async function importShared(ep) {
+  if (!relayConfigured() || !ep.fp) return false;
+  try {
+    const r = await fetch(`${RELAY_URL}/shared/${ep.fp}`, { cache: 'no-store' });
+    if (!r.ok) return false;
+    const data = await r.json();
+    if ((data.meta.scanVersion || 1) < SCANNER_VERSION || !data.cues.length) return false;
+    const cues = data.cues.map((c) => ({ id: uid(), start: c.start, end: c.end, bbox: c.bbox, hebrew: c.hebrew || '', english: c.english || '',
+      confidence: c.confidence ?? 0.9, status: 'done', source: 'shared', edited: !!c.edited, aiTried: true }));
+    cues.sort((a, b) => a.start - b.start);
+    if (Scan.ep && Scan.ep.id === ep.id) Scan.stop();
+    cuesById.set(ep.id, cues);
+    ep.coverage = [[0, ep.duration]];
+    if (data.meta.band) ep.band = data.meta.band;
+    ep.shared = 'imported'; ep.scanVersion = data.meta.scanVersion;
+    await DB.put('cues', ep.id, cues);
+    saveEp(ep); changed(ep, cues);
+    if (P.id === ep.id) { P.cues = cuesById.get(ep.id); computeBand(); renderList(true); renderOverlay(true); }
+    return true;
+  } catch { return false; }
+}
+
+// Offer this episode's finished subtitles to others — only AI-quality ones, so a weaker offline
+// version never takes the place of a better one.
+let shareTimers = new Map();
+function maybeShare(ep) {
+  if (!relayConfigured() || !ep.fp || ep.status !== 'ready' || ep.shared === 'imported' && !ep.editedSinceImport) return;
+  const cues = cuesById.get(ep.id) || [];
+  const good = cues.filter((c) => c.source === 'ai' || c.source === 'shared' || c.edited).length;
+  if (!cues.length || good < cues.length * 0.8 || shareTimers.has(ep.id)) return;
+  shareTimers.set(ep.id, setTimeout(async () => {
+    shareTimers.delete(ep.id);
+    const body = {
+      meta: { duration: ep.duration, width: ep.width, height: ep.height, size: ep.size, band: ep.band, scanVersion: ep.scanVersion || SCANNER_VERSION },
+      cues: cues.filter((c) => c.english).map((c) => ({ start: c.start, end: c.end, bbox: c.bbox, hebrew: c.hebrew, english: c.english, confidence: c.confidence, edited: !!c.edited })),
+    };
+    try {
+      const r = await fetch(`${RELAY_URL}/shared/${ep.fp}`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      if (r.ok) { ep.shared = 'shared'; ep.editedSinceImport = false; saveEp(ep); libDirty = true; }
+    } catch { /* try again on the next change */ }
+  }, 5000));
+}
+
 async function createEpisode(chosenFile, handle, show, mode) {
   const f = chosenFile;
   const existing = [...episodes.values()].find((e) => e.fileName === f.name && e.size === f.size);
@@ -225,7 +282,10 @@ async function createEpisode(chosenFile, handle, show, mode) {
   await DB.put('cues', ep.id, []);
   if (info.thumb) await DB.put('blobs', ep.id + '/thumb', info.thumb);
   if (handle) { handles.set(ep.id, handle); await DB.put('handles', ep.id, handle); }
+  try { ep.fp = await fingerprint(f); saveEp(ep); } catch { /* sharing just won't apply */ }
+  const imported = await importShared(ep);
   libDirty = true;
+  if (imported) toast('These subtitles were already prepared — ready to watch, no waiting.');
   tick();
   return ep;
 }
@@ -239,7 +299,7 @@ async function redoEpisode(id) {
   await DB.delRange('blobs', id + '/');
   if (thumb) await DB.put('blobs', id + '/thumb', thumb);
   cuesById.set(id, []);
-  ep.coverage = []; delete ep.band; ep.status = 'processing'; ep.scanVersion = SCANNER_VERSION;
+  ep.coverage = []; delete ep.band; ep.status = 'processing'; ep.scanVersion = SCANNER_VERSION; ep.shared = null;
   await DB.put('cues', id, []);
   saveEp(ep);
   if (P.id === id) { P.cues = cuesById.get(id); P.cueEls.clear(); $('#cue-list').innerHTML = ''; computeBand(); renderOverlay(true); }
@@ -261,6 +321,14 @@ async function deleteEpisode(id) {
 const Scan = {
   ep: null, worker: null, video: $('#scanvid'), canvas: null, ctx: null, region: null,
   from: 0, to: 0, scanStart: 0, safe: 0, pos: 0, next: 0, busy: false, gen: 0, wgen: 0, ending: false,
+  fast: false, fastFailed: new Set(),
+
+  // Fast path for MP4/MOV (Chrome's video decoder in a worker, ~15–20x real time, keeps going in a
+  // background tab); otherwise the hidden fast-forward video below.
+  canFast(ep) {
+    const f = files.get(ep.id);
+    return !!f && 'VideoDecoder' in self && /\.(mp4|m4v|mov)$/i.test(f.name) && !this.fastFailed.has(ep.id);
+  },
 
   start(ep, from, to) {
     this.stop();
@@ -268,10 +336,15 @@ const Scan = {
     this.ep = ep; this.from = from; this.to = to; this.scanStart = from; this.safe = from; this.pos = from;
     this.next = from; this.busy = false; this.ending = false; this.region = null;
     if (!this.worker) {
-      this.worker = new Worker('scan-worker.js');
+      this.worker = new Worker('scan-worker.js', { type: 'module' });
       this.worker.onmessage = (e) => this.onMessage(e.data);
     }
     this.wgen = gen;
+    this.fast = this.canFast(ep);
+    if (this.fast) {
+      this.worker.postMessage({ type: 'decode', src: { file: files.get(ep.id) }, W: ep.width, H: ep.height, from, to, interval: SAMPLE_INTERVAL, gen });
+      return;
+    }
     this.worker.postMessage({ type: 'start', W: ep.width, H: ep.height, from, interval: SAMPLE_INTERVAL, gen });
     const v = this.video;
     v.src = videoUrl(ep.id);
@@ -327,7 +400,14 @@ const Scan = {
       this.ctx = this.canvas.getContext('2d', { willReadFrequently: true });
       if (this.waiting && this.go) this.go();
     } else if (m.type === 'ack') this.busy = false;
-    else if (m.type === 'progress' && ep) {
+    else if (m.type === 'fast-done' && ep) this.end(true);
+    else if (m.type === 'fast-unsupported' && ep) {
+      // Chrome can't decode this file directly: fall back to the playback-based scanner.
+      console.info('Fast scanning not available for this file:', m.reason);
+      this.fastFailed.add(ep.id);
+      this.start(ep, this.safe, this.to);
+    } else if (m.type === 'progress' && ep) {
+      this.pos = Math.max(this.pos, m.t);
       this.safe = m.safe;
       ep.coverage = addInterval(ep.coverage, this.scanStart, m.safe);
       saveEp(ep); changed(ep);
@@ -345,7 +425,7 @@ const Scan = {
     if (!this.ep || this.ending) return;
     this.ending = true; this.fullRange = full;
     this.gen++;
-    this.video.pause();
+    if (!this.fast) this.video.pause();
     this.worker.postMessage({ type: 'end', t: full ? this.to : this.pos, flush: full });
   },
 
@@ -597,7 +677,7 @@ async function translatePump() {
 // Optional AI polish — Claude via the owner's private relay (key never in this page)
 // =====================================================================
 const RELAY_URL = 'https://subtitle-player-relay.subtitle-player.workers.dev';
-const AI = { reachable: false, enabled: false, configured: false, remaining: 0, viewerOn: localStorage.getItem('aiOff') !== '1', backoffUntil: 0, busy: false, lastError: '', spent: 0,
+const AI = { reachable: false, enabled: false, configured: false, remaining: 0, viewerOn: localStorage.getItem('aiOff') !== '1', backoffUntil: 0, running: 0, lastError: '', spent: 0,
   settings: { imageModel: 'haiku', threshold: 0.85, think: 'off' } };
 const relayConfigured = () => /^https:/.test(RELAY_URL);
 const aiActive = () => relayConfigured() && AI.reachable && AI.enabled && AI.configured && AI.viewerOn && AI.remaining > 0 && Date.now() > AI.backoffUntil;
@@ -697,63 +777,66 @@ function contextFor(ep, batch) {
 
 const toB64 = (blob) => new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(String(r.result).split(',')[1]); r.readAsDataURL(blob); });
 
-async function aiPump() {
-  if (AI.busy || !aiActive()) return;
-  AI.busy = true;
+// Up to 3 batches at once: same cost, ~3x faster, so preparing keeps up with the fast scanner.
+const AI_PARALLEL = 3;
+function aiPump() {
+  while (AI.running < AI_PARALLEL && aiActive()) {
+    const job = pickAiBatch();
+    if (!job || !job.batch.length) break;
+    for (const c of job.batch) { c.aiBusy = true; if (c.status === 'hebrew') c.status = 'ai'; }
+    AI.running++;
+    runAiJob(job).catch((e) => console.warn('AI batch failed', e)).finally(() => { AI.running--; aiPump(); });
+  }
+}
+
+async function runAiJob(job) {
+  const { ep, batch, kind } = job;
+  const cues = cuesById.get(ep.id);
+  changed(ep, batch);
+  const sent = batch.map((c) => c.hebrew);
+  const body = contextFor(ep, batch);
+  let res;
   try {
-    while (aiActive()) {
-      const job = pickAiBatch();
-      if (!job || !job.batch.length) break;
-      const { ep, batch, kind } = job;
-      const cues = cuesById.get(ep.id);
-      for (const c of batch) { c.aiBusy = true; if (c.status === 'hebrew') c.status = 'ai'; }
-      changed(ep, batch);
-      const sent = batch.map((c) => c.hebrew);
-      const body = contextFor(ep, batch);
-      let res;
-      try {
-        if (kind === 'image') {
-          body.lines = [];
-          for (const [k, c] of batch.entries()) {
-            const blob = await DB.get('blobs', `${ep.id}/${c.id}`);
-            body.lines.push({ n: k + 1, he: c.hebrew, img: blob ? await toB64(blob) : '' });
-          }
-          body.lines = body.lines.filter((l) => l.img);
-          res = await relay('/read', body);
-        } else {
-          body.lines = batch.map((c, k) => ({ n: k + 1, he: c.hebrew }));
-          res = await relay('/polish', body);
-        }
-      } catch (e) {
-        for (const c of batch) { delete c.aiBusy; if (c.status === 'ai') c.status = 'hebrew'; }
-        changed(ep, batch);
-        aiFailed(e);
-        break;
+    if (kind === 'image') {
+      body.lines = [];
+      for (const [k, c] of batch.entries()) {
+        const blob = await DB.get('blobs', `${ep.id}/${c.id}`);
+        body.lines.push({ n: k + 1, he: c.hebrew, img: blob ? await toB64(blob) : '' });
       }
-      if (res.usage) AI.spent += res.usage.cost;
-      const removed = [];
-      batch.forEach((c, k) => {
-        delete c.aiBusy;
-        const it = (res.items || []).find((x) => x.n === k + 1);
-        if (!it || c.hebrew !== sent[k] || !cues.includes(c)) { if (c.status === 'ai') c.status = 'hebrew'; c.aiTried = true; return; }
-        if (kind === 'image' && it.not_text && !c.edited) { cues.splice(cues.indexOf(c), 1); removed.push(c.id); return; }
-        if (kind === 'text' && it.unsure && !c.edited && AI.settings.imageModel !== 'off' && !c.forcePicture) {
-          // Claude can't tell from the text: read it from the picture next.
-          c.forcePicture = true; if (c.status === 'ai') c.status = 'hebrew'; return;
-        }
-        const he = aiText(it.hebrew), en = aiText(it.english);
-        if (!c.edited && he) c.hebrew = he;
-        else if (!c.edited && !he && en) c.hebrew = en; // non-Hebrew on screen (e.g. English song lyrics)
-        c.english = rewrap(en, c.hebrew);
-        c.status = 'done'; c.source = 'ai'; c.urgent = false; c.error = null; c.aiTried = true;
-        if (!c.edited) c.confidence = Math.max(c.confidence ?? 0, it.unsure ? 0.5 : 0.9);
-      });
-      const gone = mergeSame(ep, cues);
-      saveCues(ep.id);
-      const touched = cues.filter((x) => x._touched); touched.forEach((x) => delete x._touched);
-      changed(ep, batch.filter((c) => cues.includes(c)).concat(touched), removed.concat(gone.map((x) => x.id)));
+      body.lines = body.lines.filter((l) => l.img);
+      res = await relay('/read', body);
+    } else {
+      body.lines = batch.map((c, k) => ({ n: k + 1, he: c.hebrew }));
+      res = await relay('/polish', body);
     }
-  } finally { AI.busy = false; }
+  } catch (e) {
+    for (const c of batch) { delete c.aiBusy; if (c.status === 'ai') c.status = 'hebrew'; }
+    changed(ep, batch);
+    aiFailed(e);
+    return;
+  }
+  if (res.usage) AI.spent += res.usage.cost;
+  const removed = [];
+  batch.forEach((c, k) => {
+    delete c.aiBusy;
+    const it = (res.items || []).find((x) => x.n === k + 1);
+    if (!it || c.hebrew !== sent[k] || !cues.includes(c)) { if (c.status === 'ai') c.status = 'hebrew'; c.aiTried = true; return; }
+    if (kind === 'image' && it.not_text && !c.edited) { cues.splice(cues.indexOf(c), 1); removed.push(c.id); return; }
+    if (kind === 'text' && it.unsure && !c.edited && AI.settings.imageModel !== 'off' && !c.forcePicture) {
+      // Claude can't tell from the text: read it from the picture next.
+      c.forcePicture = true; if (c.status === 'ai') c.status = 'hebrew'; return;
+    }
+    const he = aiText(it.hebrew), en = aiText(it.english);
+    if (!c.edited && he) c.hebrew = he;
+    else if (!c.edited && !he && en) c.hebrew = en; // non-Hebrew on screen (e.g. English song lyrics)
+    c.english = rewrap(en, c.hebrew);
+    c.status = 'done'; c.source = 'ai'; c.urgent = false; c.error = null; c.aiTried = true;
+    if (!c.edited) c.confidence = Math.max(c.confidence ?? 0, it.unsure ? 0.5 : 0.9);
+  });
+  const gone = mergeSame(ep, cues);
+  saveCues(ep.id);
+  const touched = cues.filter((x) => x._touched); touched.forEach((x) => delete x._touched);
+  changed(ep, batch.filter((c) => cues.includes(c)).concat(touched), removed.concat(gone.map((x) => x.id)));
 }
 
 // =====================================================================
@@ -769,7 +852,7 @@ async function thumbUrl(id) {
 }
 
 function statusOf(ep) {
-  if (ep.status === 'ready') return { dot: 'ok', text: `Ready · ${progressOf(ep).total} lines` };
+  if (ep.status === 'ready') return { dot: 'ok', text: `Ready · ${progressOf(ep).total} lines${ep.shared === 'imported' ? ' · shared, no processing needed' : ep.shared === 'shared' ? ' · shared for others' : ''}` };
   if (ep.status === 'paused') return { dot: '', text: `Paused · ${progressOf(ep).overall}%` };
   if (!files.has(ep.id)) return { dot: '', text: `Waiting for the video · ${progressOf(ep).overall}% — open it to continue` };
   return { dot: 'busy', text: `Preparing subtitles · ${progressOf(ep).overall}%` };
@@ -948,6 +1031,7 @@ function showNeedFile() {
 
 function loadVideo() {
   const ep = P.ep;
+  if (!ep.fp && files.has(ep.id)) fingerprint(files.get(ep.id)).then((fp) => { ep.fp = fp; saveEp(ep); updateStatus(ep); }).catch(() => {});
   $('#missing').classList.add('hidden');
   video.src = videoUrl(ep.id);
   video.addEventListener('loadedmetadata', () => {
@@ -1344,6 +1428,7 @@ function saveCue(id, field, value) {
   } else { c.english = value; c.edited = true; c.status = 'done'; c.urgent = false; }
   saveCues(P.id);
   changed(P.ep, [c]);
+  if (P.ep.shared) { P.ep.shared = 'edited'; P.ep.editedSinceImport = true; }
 }
 
 // =====================================================================

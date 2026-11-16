@@ -1,9 +1,10 @@
 // Offline support: keeps the app, the OCR engine and the Hebrew OCR data in the browser's
 // cache, so the player works with no internet after the first visit.
-const VERSION = 'v5';
+const VERSION = 'v6';
 const CORE = [
   './', 'index.html', 'app.js', 'scan-worker.js', 'icon.svg', 'manifest.webmanifest',
   'vendor/tesseract/tesseract.min.js', 'vendor/tesseract/worker.min.js', 'vendor/lang/heb.traineddata.gz',
+  'vendor/mp4box/mp4box.all.mjs', 'vendor/mp4box/styp-BV5G3FS-.mjs', 'vendor/mp4box/rolldown-runtime-CNh9ExCG.mjs',
 ];
 
 self.addEventListener('install', (e) => {
