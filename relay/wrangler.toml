@@ -1,0 +1,13 @@
+name = "subtitle-player-relay"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+ALLOWED_ORIGINS = "https://itaiw-droid.github.io"
+DAILY_LIMIT = "400"
+
+# Filled in by `wrangler kv namespace create SETTINGS`
+[[kv_namespaces]]
+binding = "SETTINGS"
+id = "356f13f432d14cf2bfdaa651dbd0c698"

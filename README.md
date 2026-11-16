@@ -20,6 +20,17 @@ E subtitle list · F fullscreen · Esc back.
 In the subtitle list, lines the app is unsure of are marked **Check Hebrew**. Fix a Hebrew line and it
 is re-translated; or edit the English directly.
 
+## Optional AI polish (Claude)
+
+The **AI polish** button turns on Claude for better accuracy: Claude Haiku fixes OCR mistakes and translates
+with the surrounding lines for context; lines it can't make sense of are read from a small snapshot by
+Claude Sonnet. Only subtitle text and those snapshots are sent — never the video.
+
+Calls go through a small relay (`relay/`, a Cloudflare Worker) that holds the API key, only answers this
+site, and enforces a daily limit. The site owner turns AI on/off for everyone from the AI polish panel
+(owner passcode); each viewer can also turn it off for themselves. When AI is off or unavailable, the
+free offline method below is used automatically.
+
 ## How it works
 
 - `scan-worker.js` looks at the bottom of the frame while a hidden copy of the video plays fast-forward,

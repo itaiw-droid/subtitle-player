@@ -75,7 +75,7 @@ function saveCues(id) {
   clearTimeout(saveTimers.get('c' + id));
   saveTimers.set('c' + id, setTimeout(() => {
     if (!episodes.has(id)) return;
-    DB.put('cues', id, (cuesById.get(id) || []).map(({ ocrBlob, _touched, ...c }) => c));
+    DB.put('cues', id, (cuesById.get(id) || []).map(({ ocrBlob, _touched, aiBusy, ...c }) => c));
   }, 600));
 }
 
@@ -350,7 +350,7 @@ function tick() {
     Scan.start(ep, from, nextCoveredStart(ep.coverage, from, ep.duration));
     break;
   }
-  ocrPump();
+  ocrPump(); translatePump(); aiPump();
 }
 setInterval(tick, 1500);
 
@@ -449,12 +449,12 @@ async function ocrPump() {
         saveCues(ep.id); changed(ep, [], [c.id]);
         continue;
       }
-      c.hebrew = res.text; c.confidence = res.confidence; c.status = 'hebrew';
+      c.hebrew = res.text; c.confidence = res.confidence; c.status = 'hebrew'; c.hebrewAt = Date.now();
       const gone = mergeSame(ep, cues);
       saveCues(ep.id);
       const touched = cues.filter((x) => x._touched); touched.forEach((x) => delete x._touched);
       changed(ep, gone.includes(c) ? touched : [c, ...touched], gone.map((x) => x.id));
-      translatePump();
+      translatePump(); aiPump();
     }
   } finally { ocrBusy = false; }
 }
@@ -508,6 +508,7 @@ document.addEventListener('keydown', () => { if (TR.state === 'needs-click') ini
 function updateTrUi() {
   const n = $('#tr-notice');
   let html = '';
+  if (aiActive() && TR.state === 'unsupported') { n.classList.add('hidden'); if (P.ep) updateEpisodeUi(); return; }
   if (TR.state === 'unsupported') html = 'English subtitles are made by <b>Google Chrome</b>\'s built-in translator (Chrome 138 or newer on a computer). Open this page in Chrome to get English — Hebrew reading works here too.';
   else if (TR.state === 'needs-click') html = '<b>One click to turn on English.</b> Chrome sets up its built-in Hebrew translator once — it stays on this computer, no account. <button class="btn small primary" id="tr-enable">Turn on English</button>';
   else if (TR.state === 'downloading') html = `Setting up Chrome's Hebrew translator… ${Math.round(TR.dl * 100)}%`;
@@ -517,7 +518,7 @@ function updateTrUi() {
 }
 
 function rewrap(english, hebrew) {
-  if (!/\n/.test(hebrew) || english.length < 28) return english;
+  if (!/\n/.test(hebrew) || /\n/.test(english) || english.length < 28) return english;
   const mid = english.length / 2;
   let best = -1;
   for (let i = 0; i < english.length; i++) if (english[i] === ' ' && (best < 0 || Math.abs(i - mid) < Math.abs(best - mid))) best = i;
@@ -534,7 +535,7 @@ async function translatePump() {
       for (const ep of episodes.values()) {
         if (ep.status === 'paused') continue;
         for (const c of cuesById.get(ep.id) || []) {
-          if (c.status !== 'hebrew') continue;
+          if (c.status !== 'hebrew' || !offlineMayTake(ep, c)) continue;
           const pr = c.urgent ? -1e9 : priority(ep, c);
           if (!best || pr < best.pr) best = { ep, c, pr };
         }
@@ -548,11 +549,163 @@ async function translatePump() {
         if (c.hebrew !== src) { c.status = 'hebrew'; continue; } // edited meanwhile
         c.english = rewrap(en.trim(), src); c.error = null;
       } catch (e) { c.english = c.english || ''; c.error = 'Translation failed'; }
-      c.status = 'done'; c.urgent = false;
+      c.status = 'done'; c.urgent = false; c.source = 'offline';
       saveCues(ep.id);
       changed(ep, [c]);
     }
   } finally { trBusy = false; }
+}
+
+// =====================================================================
+// Optional AI polish — Claude via the owner's private relay (key never in this page)
+// =====================================================================
+const RELAY_URL = 'https://subtitle-player-relay.subtitle-player.workers.dev';
+const AI = { reachable: false, enabled: false, configured: false, remaining: 0, viewerOn: localStorage.getItem('aiOff') !== '1', backoffUntil: 0, busy: false, lastError: '' };
+const relayConfigured = () => /^https:/.test(RELAY_URL);
+const aiActive = () => relayConfigured() && AI.reachable && AI.enabled && AI.configured && AI.viewerOn && AI.remaining > 0 && Date.now() > AI.backoffUntil;
+
+// With AI on, the offline translator only steps in for lines the viewer is about to see
+// that AI hasn't handled in time — so English never stalls.
+function offlineMayTake(ep, c) {
+  if (!aiActive()) return true;
+  const watching = watch.id === ep.id && Date.now() - watch.at < 15000;
+  return watching && c.start - watch.t < 12 && c.end > watch.t - 2 && Date.now() - (c.hebrewAt || 0) > 7000 && !c.aiBusy;
+}
+
+async function aiStatus() {
+  if (!relayConfigured()) return updateAiUi();
+  try {
+    const r = await fetch(RELAY_URL + '/status', { cache: 'no-store' });
+    const j = await r.json();
+    AI.reachable = r.ok; AI.enabled = !!j.enabled; AI.configured = !!j.configured; AI.remaining = j.remaining || 0;
+  } catch { AI.reachable = false; }
+  updateAiUi();
+  aiPump();
+}
+setInterval(aiStatus, 60000);
+
+async function relay(path, body) {
+  const r = await fetch(RELAY_URL + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw Object.assign(new Error(j.error || `Relay error ${r.status}`), { status: r.status });
+  AI.remaining = Math.max(0, AI.remaining - 1);
+  return j;
+}
+
+// Claude sometimes writes line breaks as a literal "\\n" or " / ".
+const aiText = (t) => String(t || '').replace(/\\n/g, '\n').replace(/\s+\/\s+/g, '\n').replace(/[ \t]+\n/g, '\n').trim();
+
+function aiFailed(e) {
+  AI.lastError = e.message;
+  if (e.status === 503) { AI.enabled = false; aiStatus(); }
+  else if (e.status === 429) { AI.backoffUntil = Date.now() + 5 * 60000; if (/limit/i.test(e.message)) AI.remaining = 0; }
+  else AI.backoffUntil = Date.now() + 60000;
+  updateAiUi();
+  translatePump();
+}
+
+// Next batch for Claude: new lines first (the viewer's next ones before anything else), then
+// background upgrades of lines the offline translator already did, away from the playhead.
+function pickAiBatch() {
+  let best = null;
+  for (const ep of episodes.values()) {
+    if (ep.status === 'paused') continue;
+    for (const c of cuesById.get(ep.id) || []) {
+      if (c.status !== 'hebrew' || c.aiBusy) continue;
+      const pr = c.urgent ? -1e9 : priority(ep, c);
+      if (!best || pr < best.pr) best = { ep, c, pr };
+    }
+  }
+  const take = (ep, head, ok, max) => {
+    const cues = cuesById.get(ep.id);
+    const batch = [];
+    for (let i = cues.indexOf(head); i < cues.length && batch.length < max; i++) {
+      if (ok(cues[i])) batch.push(cues[i]); else if (batch.length) break;
+    }
+    return { ep, batch };
+  };
+  if (best) return take(best.ep, best.c, (c) => c.status === 'hebrew' && !c.aiBusy, 14);
+  const upgradable = (ep, c) => c.status === 'done' && c.source !== 'ai' && !c.edited && !c.aiTried && !c.aiBusy && c.hebrew &&
+    !(watch.id === ep.id && c.end > watch.t - 2 && c.start < watch.t + 25);
+  for (const ep of episodes.values()) {
+    if (ep.status === 'paused') continue;
+    const cues = cuesById.get(ep.id) || [];
+    const head = cues.find((c) => upgradable(ep, c));
+    if (head) return take(ep, head, (c) => upgradable(ep, c), 14);
+  }
+  return null;
+}
+
+async function aiPump() {
+  if (AI.busy || !aiActive()) return;
+  AI.busy = true;
+  try {
+    while (aiActive()) {
+      const job = pickAiBatch();
+      if (!job || !job.batch.length) break;
+      const { ep, batch } = job;
+      const cues = cuesById.get(ep.id);
+      for (const c of batch) { c.aiBusy = true; if (c.status === 'hebrew') c.status = 'ai'; }
+      changed(ep, batch);
+      const i0 = cues.indexOf(batch[0]), i1 = cues.indexOf(batch[batch.length - 1]);
+      const before = cues.slice(Math.max(0, i0 - 8), i0).filter((c) => c.english).map((c) => ({ he: c.hebrew, en: c.english }));
+      const after = cues.slice(i1 + 1, i1 + 4).filter((c) => c.hebrew).map((c) => c.hebrew);
+      const sent = batch.map((c) => c.hebrew);
+      let res;
+      try {
+        res = await relay('/polish', { show: ep.show, before, after, lines: batch.map((c, k) => ({ n: k + 1, he: c.hebrew })) });
+      } catch (e) {
+        for (const c of batch) { delete c.aiBusy; if (c.status === 'ai') c.status = 'hebrew'; }
+        changed(ep, batch);
+        aiFailed(e);
+        break;
+      }
+      const unsure = [];
+      batch.forEach((c, k) => {
+        delete c.aiBusy;
+        c.aiTried = true;
+        const it = (res.items || []).find((x) => x.n === k + 1);
+        if (!it || c.hebrew !== sent[k]) { if (c.status === 'ai') c.status = 'hebrew'; return; } // missing, or edited meanwhile
+        if (!c.edited && aiText(it.hebrew)) c.hebrew = aiText(it.hebrew);
+        c.english = rewrap(aiText(it.english), c.hebrew);
+        c.status = 'done'; c.source = 'ai'; c.urgent = false; c.error = null;
+        if (!c.edited) c.confidence = Math.max(c.confidence ?? 0, it.unsure ? 0.5 : 0.9);
+        if (it.unsure && !c.edited) unsure.push(c);
+      });
+      const gone = mergeSame(ep, cues);
+      saveCues(ep.id);
+      const touched = cues.filter((x) => x._touched); touched.forEach((x) => delete x._touched);
+      changed(ep, batch.filter((c) => !gone.includes(c)).concat(touched), gone.map((x) => x.id));
+      if (unsure.length) await aiRead(ep, unsure);
+    }
+  } finally { AI.busy = false; }
+}
+
+// Lines Claude couldn't make sense of from OCR text: let it read them from the picture.
+async function aiRead(ep, list) {
+  const toB64 = (blob) => new Promise((resolve) => { const r = new FileReader(); r.onload = () => resolve(String(r.result).split(',')[1]); r.readAsDataURL(blob); });
+  for (let i = 0; i < list.length && aiActive(); i += 8) {
+    const part = list.slice(i, i + 8);
+    const lines = [];
+    for (const [k, c] of part.entries()) {
+      const blob = await DB.get('blobs', `${ep.id}/${c.id}`);
+      if (blob) lines.push({ n: k + 1, he: c.hebrew, img: await toB64(blob) });
+    }
+    if (!lines.length) continue;
+    const cues = cuesById.get(ep.id);
+    let res;
+    try { res = await relay('/read', { show: ep.show, lines }); } catch (e) { aiFailed(e); return; }
+    const removed = [], updated = [];
+    part.forEach((c, k) => {
+      const it = (res.items || []).find((x) => x.n === k + 1);
+      if (!it || !cues.includes(c) || c.edited) return;
+      if (it.not_text) { cues.splice(cues.indexOf(c), 1); removed.push(c.id); return; }
+      c.hebrew = aiText(it.hebrew) || c.hebrew; c.english = rewrap(aiText(it.english), c.hebrew); c.confidence = 0.9;
+      updated.push(c);
+    });
+    saveCues(ep.id);
+    changed(ep, updated, removed);
+  }
 }
 
 // =====================================================================
@@ -777,7 +930,7 @@ function updateEpisodeUi() {
   const t = video.currentTime || 0;
   const prog = progressOf(ep);
   let msg = '', persist = false, cls = 'busy';
-  if (TR.state !== 'ready' && ep.status !== 'ready') {
+  if (TR.state !== 'ready' && !aiActive() && ep.status !== 'ready') {
     msg = TR.state === 'downloading' ? `Setting up translation… ${Math.round(TR.dl * 100)}%` : TR.state === 'unsupported' ? 'English needs Google Chrome' : 'Click anywhere to turn on English';
     cls = 'bad'; persist = true;
   } else if (ep.status === 'ready') { msg = `${prog.total} subtitles · ready`; cls = 'ok'; }
@@ -788,6 +941,7 @@ function updateEpisodeUi() {
     if (ready == null) { msg = 'Reading subtitles from here…'; persist = !video.paused; }
     else if (ready - t < 4 && ready < ep.duration - 1) { msg = 'Translating the next lines…'; persist = !video.paused; }
     else msg = `English ready to ${fmt(ready)} · ${prog.overall}% overall`;
+    if (aiActive()) msg += ' · AI';
   }
   txt.textContent = msg; dot.className = 'dot ' + cls;
   chip.classList.toggle('persist', persist);
@@ -1001,7 +1155,8 @@ function fillCueEl(el, c) {
   el.querySelector('.t').textContent = fmt(c.start);
   const badges = [];
   if (c.status === 'pending' || c.status === 'ocr') badges.push('<span class="badge">Reading…</span>');
-  if (c.status === 'hebrew' || c.status === 'translating') badges.push('<span class="badge">Translating…</span>');
+  if (c.status === 'hebrew' || c.status === 'translating' || c.status === 'ai') badges.push('<span class="badge">Translating…</span>');
+  if (c.source === 'ai' && c.status === 'done') badges.push('<span class="badge" title="Fixed and translated by Claude">AI</span>');
   if (isLow(c)) badges.push('<span class="badge warn">Check Hebrew</span>');
   if (c.edited) badges.push('<span class="badge">Edited</span>');
   if (c.error) badges.push(`<span class="badge err" title="${esc(c.error)}">Problem</span>`);
@@ -1054,13 +1209,57 @@ function saveCue(id, field, value) {
   if (!c || (c[field] || '') === value) return;
   if (field === 'hebrew') {
     // Corrected Hebrew: re-translate just this line, first in line.
-    c.hebrew = value; c.edited = true; c.confidence = 1; c.english = ''; c.status = 'hebrew'; c.urgent = true;
+    c.hebrew = value; c.edited = true; c.confidence = 1; c.english = ''; c.status = 'hebrew'; c.urgent = true; c.hebrewAt = 0; c.aiTried = false;
     toast(TR.translator ? 'Re-translating this line…' : 'Saved. English will update once translation is on.', 1800);
-    translatePump();
+    aiPump(); translatePump();
   } else { c.english = value; c.edited = true; c.status = 'done'; c.urgent = false; }
   saveCues(P.id);
   changed(P.ep, [c]);
 }
+
+// =====================================================================
+// AI settings dialog
+// =====================================================================
+function updateAiUi() {
+  const s = $('#ai-status'), btn = $('#ai-btn');
+  let text, dot;
+  if (!relayConfigured()) { text = 'Not set up on this site.'; dot = ''; }
+  else if (!AI.reachable) { text = 'Can\'t reach the AI service right now — using the offline method.'; dot = 'bad'; }
+  else if (!AI.configured) { text = 'The AI service has no Claude key yet.'; dot = 'bad'; }
+  else if (!AI.enabled) { text = 'Turned off by the site owner — using the offline method.'; dot = ''; }
+  else if (AI.remaining <= 0) { text = 'Today\'s AI allowance is used up — using the offline method until tomorrow.'; dot = ''; }
+  else if (Date.now() < AI.backoffUntil) { text = `Paused for a few minutes (${AI.lastError}) — using the offline method meanwhile.`; dot = 'busy'; }
+  else { text = `Available · ${AI.remaining} requests left today.`; dot = 'ok'; }
+  s.innerHTML = `<span class="dot ${dot}"></span>${esc(text)}`;
+  $('#ai-viewer').checked = AI.viewerOn;
+  btn.classList.toggle('on', aiActive());
+  btn.title = aiActive() ? 'AI polish is on' : 'AI polish is off';
+  updateTrUi();
+}
+$('#ai-btn').onclick = () => { aiStatus(); $('#ai-dialog').classList.remove('hidden'); $('#owner-token').value = localStorage.getItem('aiOwnerToken') || ''; };
+$('#ai-close').onclick = () => $('#ai-dialog').classList.add('hidden');
+$('#ai-dialog').addEventListener('click', (e) => { if (e.target.id === 'ai-dialog') $('#ai-dialog').classList.add('hidden'); });
+$('#ai-viewer').onchange = (e) => {
+  AI.viewerOn = e.target.checked;
+  localStorage.setItem('aiOff', AI.viewerOn ? '0' : '1');
+  updateAiUi();
+  if (aiActive()) aiPump(); else translatePump();
+};
+async function ownerSet(enabled) {
+  const token = $('#owner-token').value.trim();
+  const msg = $('#owner-msg');
+  if (!relayConfigured()) { msg.textContent = 'The AI service isn\'t set up yet.'; return; }
+  try {
+    const r = await fetch(RELAY_URL + '/admin', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token, enabled }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'Failed');
+    localStorage.setItem('aiOwnerToken', token);
+    msg.textContent = enabled ? 'AI is now ON for everyone.' : 'AI is now OFF for everyone.';
+    aiStatus();
+  } catch (e) { msg.textContent = e.message; }
+}
+$('#owner-on').onclick = () => ownerSet(true);
+$('#owner-off').onclick = () => ownerSet(false);
 
 // =====================================================================
 // Routing & start-up
@@ -1082,7 +1281,7 @@ function route() {
   for (const [id, ep] of await DB.all('episodes')) episodes.set(id, ep);
   for (const [id, cues] of await DB.all('cues')) {
     if (!episodes.has(id)) continue;
-    for (const c of cues) { if (c.status === 'ocr') c.status = 'pending'; if (c.status === 'translating') c.status = 'hebrew'; }
+    for (const c of cues) { if (c.status === 'ocr') c.status = 'pending'; if (c.status === 'translating' || c.status === 'ai') c.status = 'hebrew'; }
     cuesById.set(id, cues);
   }
   for (const [id, h] of await DB.all('handles')) if (episodes.has(id)) handles.set(id, h);
@@ -1093,5 +1292,6 @@ function route() {
   route();
   tick();
   initTranslator(false);
+  aiStatus();
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 })();
