@@ -1,6 +1,6 @@
 // Offline support: keeps the app, the OCR engine and the Hebrew OCR data in the browser's
 // cache, so the player works with no internet after the first visit.
-const VERSION = 'v3';
+const VERSION = 'v4';
 const CORE = [
   './', 'index.html', 'app.js', 'scan-worker.js', 'icon.svg', 'manifest.webmanifest',
   'vendor/tesseract/tesseract.min.js', 'vendor/tesseract/worker.min.js', 'vendor/lang/heb.traineddata.gz',

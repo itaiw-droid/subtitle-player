@@ -92,9 +92,10 @@ label.field input:focus, label.field textarea:focus { outline: none; border-colo
 #overlay { position: absolute; pointer-events: none; }
 .sub-box {
   position: absolute; display: flex; flex-direction: column; justify-content: center; align-items: center;
-  background: var(--mask); border-radius: 7px; box-shadow: 0 0 10px 6px var(--mask);
-  text-align: center; padding: 0 0.5em; line-height: 1.22; color: #fff; font-weight: 500;
-  text-shadow: 0 1px 2px rgba(0,0,0,.6); white-space: pre-line; transform: translateX(-50%);
+  background: var(--mask); border-radius: 8px; box-shadow: 0 0 12px 7px var(--mask);
+  text-align: center; padding: 0 0.6em; line-height: 1.25; color: #fff; font-weight: 500;
+  white-space: pre-line; transform: translateX(-50%); box-sizing: border-box;
+  transition: width .15s ease, min-height .15s ease;
 }
 .sub-box .he { direction: rtl; unicode-bidi: plaintext; }
 .sub-box .he.small { opacity: .62; font-size: .72em; margin-top: .25em; }
@@ -124,6 +125,7 @@ label.field input:focus, label.field textarea:focus { outline: none; border-colo
 .ctrls .spacer { flex: 1; }
 .seg-ctl { display: flex; background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.09); border-radius: 10px; padding: 3px; }
 .seg-ctl button { border: 0; background: transparent; padding: 6px 11px; border-radius: 7px; font-size: 12.5px; color: #c9c9ce; }
+.size-ctl button { min-width: 38px; font-variant-numeric: tabular-nums; }
 .seg-ctl button.on { background: #fff; color: #000; font-weight: 600; }
 .center-msg { position: absolute; inset: 0; display: grid; place-items: center; text-align: center; padding: 24px; }
 .center-msg .box { max-width: 460px; background: rgba(18,18,21,.95); border: 1px solid var(--line); border-radius: 16px; padding: 26px; }
@@ -251,6 +253,9 @@ details.owner summary { cursor: pointer; color: var(--muted); font-size: 13.5px;
           <div class="spacer"></div>
           <div class="seg-ctl" id="modes" title="Subtitles (S)">
             <button data-m="en">English</button><button data-m="he">עברית</button><button data-m="both">Both</button><button data-m="off">Off</button>
+          </div>
+          <div class="seg-ctl size-ctl" title="Subtitle size (− / +)">
+            <button id="size-down" aria-label="Smaller subtitles">A−</button><button id="size-val" title="Reset size">100%</button><button id="size-up" aria-label="Bigger subtitles">A+</button>
           </div>
           <button class="iconbtn" id="list-btn" title="Subtitle list (E)"><svg viewBox="0 0 24 24"><path d="M4 6h16v2H4zm0 5h16v2H4zm0 5h10v2H4z"/></svg></button>
           <button class="iconbtn" id="fs-btn" title="Fullscreen (F)"><svg viewBox="0 0 24 24"><path d="M5 5h5v2H7v3H5zm9 0h5v5h-2V7h-3zM5 14h2v3h3v2H5zm12 3v-3h2v5h-5v-2z"/></svg></button>

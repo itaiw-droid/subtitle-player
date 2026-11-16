@@ -884,6 +884,7 @@ async function openPlayer(id, withList) {
   $('#overlay').innerHTML = '';
   $('#p-title').textContent = ep.title; document.title = ep.title;
   setModeButtons();
+  computeBand();
   renderList(true);
   updateEpisodeUi();
   const f = await fileFor(ep, false);
@@ -929,6 +930,7 @@ function closePlayer() {
 video.addEventListener('error', () => { if (P.ep && video.getAttribute('src')) toast('Chrome can\'t play this video format. Try converting it to MP4.', 8000); });
 
 function onPlayerCues(upsert, removed) {
+  scheduleBand();
   for (const id of removed) { P.cueEls.get(id)?.remove(); P.cueEls.delete(id); }
   renderList(false, upsert.map((c) => c.id));
   renderOverlay(true);
@@ -996,30 +998,90 @@ function cueAt(t) {
   return null;
 }
 
+// ---- consistent subtitle box ----
+// Standard boxes for the episode, learned from all detected lines: one size for one-line subtitles
+// and one for two-line subtitles, same width, same centre, same bottom edge. So the black backdrop
+// doesn't jump around from line to line. A line that reaches outside its standard box grows it just
+// enough to still cover the Hebrew; captions elsewhere (credits, name tags) get their own box.
+const pct = (arr, p) => { const a = arr.slice().sort((x, y) => x - y); return a[Math.min(a.length - 1, Math.max(0, Math.floor(p * (a.length - 1))))]; };
+let bandTimer = null;
+function scheduleBand() { clearTimeout(bandTimer); bandTimer = setTimeout(() => { computeBand(); renderOverlay(true); }, 800); }
+function computeBand() {
+  P.band = null;
+  const all = P.cues.filter((c) => c.bbox && c.hebrew);
+  if (all.length < 10) return;
+  const medBottom = pct(all.map((c) => c.bbox[1] + c.bbox[3]), 0.5);
+  const main = all.filter((c) => Math.abs(c.bbox[1] + c.bbox[3] - medBottom) < 0.05 && Math.abs(c.bbox[0] + c.bbox[2] / 2 - 0.5) < 0.15);
+  if (main.length < 8) return;
+  const lines = (c) => c.hebrew.split('\n').length;
+  const one = main.filter((c) => lines(c) === 1), two = main.filter((c) => lines(c) === 2);
+  const h1 = one.length >= 5 ? pct(one.map((c) => c.bbox[3]), 0.75) : 0.05;
+  const h2 = two.length >= 3 ? pct(two.map((c) => c.bbox[3]), 0.75) : h1 * 2.3;
+  P.band = {
+    cx: pct(main.map((c) => c.bbox[0] + c.bbox[2] / 2), 0.5),
+    w: pct(main.map((c) => c.bbox[2]), 0.8),
+    bottom: pct(main.map((c) => c.bbox[1] + c.bbox[3]), 0.75),
+    h1, h2: Math.max(h2, h1 * 1.6),
+  };
+}
+// Box for a line as [x0, y0, x1, y1] in 0..1 video coordinates, plus whether it's a standard box.
+function boxFor(c) {
+  const [bx, by, bw, bh] = c.bbox;
+  const b = P.band;
+  const own = [bx, by, bx + bw, by + bh];
+  if (!b || Math.abs(by + bh - b.bottom) > 0.06 || Math.abs(bx + bw / 2 - b.cx) > 0.2) return { box: own, band: false };
+  // One-line or two-line standard box: by the text, or by the Hebrew's actual height on screen.
+  const twoLines = c.hebrew.split('\n').length >= 2 || by < b.bottom - b.h1 - 0.012;
+  const h = twoLines ? b.h2 : b.h1;
+  const std = [b.cx - b.w / 2, b.bottom - h, b.cx + b.w / 2, b.bottom];
+  // Small overshoots are already covered by the box's padding, so only grow for real ones.
+  const tx = 0.012, ty = 0.012;
+  return { box: [own[0] < std[0] - tx ? own[0] : std[0], own[1] < std[1] - ty ? own[1] : std[1], own[2] > std[2] + tx ? own[2] : std[2], own[3] > std[3] + ty ? own[3] : std[3]], band: true, std };
+}
+
+P.scale = Math.min(1.8, Math.max(0.6, Number(localStorage.getItem('subScale')) || 1));
+function setScale(v) {
+  P.scale = Math.round(Math.min(1.8, Math.max(0.6, v)) * 10) / 10;
+  localStorage.setItem('subScale', String(P.scale));
+  $('#size-val').textContent = Math.round(P.scale * 100) + '%';
+  renderOverlay(true);
+}
+
 let shownKey = '';
 function renderOverlay(force) {
   if (!P.ep) return;
-  const c = cueAt(video.currentTime);
+  const t = video.currentTime;
+  let c = cueAt(t);
   const mode = P.mode;
-  const key = c ? `${c.id}|${c.status}|${c.english}|${c.hebrew}|${mode}|${vrect.w}|${vrect.h}` : `none|${mode}`;
+  // Short gap between two lines in the usual spot: keep the (empty) box up instead of flickering.
+  let bridge = false;
+  if (!c && P.band) {
+    const next = P.cues.find((x) => x.start - 0.18 > t);
+    const prev = [...P.cues].reverse().find((x) => x.end + 0.12 < t);
+    if (prev && next && next.start - prev.end < 0.7 && boxFor(prev).band && boxFor(next).band && prev.english && next.english) bridge = true;
+  }
+  const key = c ? `${c.id}|${c.status}|${c.english}|${c.hebrew}|${mode}|${vrect.w}|${vrect.h}|${P.scale}|${JSON.stringify(P.band)}` : `none|${bridge}|${mode}|${P.scale}`;
   if (!force && key === shownKey) return;
   shownKey = key;
   const ov = $('#overlay');
   if ((c?.id || null) !== P.activeId) { P.activeId = c?.id || null; markActive(); }
+  const font = Math.max(12, vrect.h * 0.043 * P.scale);
+  const padX = font * 0.7, padY = font * 0.32;
+  const place = (box, text) => {
+    const [x0, y0, x1, y1] = box;
+    const width = (x1 - x0) * vrect.w + padX * 2;
+    const minH = (y1 - y0) * vrect.h + padY * 2;
+    const left = ((x0 + x1) / 2) * vrect.w;
+    const bottom = vrect.h - y1 * vrect.h - padY;
+    return `<div class="sub-box" style="left:${left}px;bottom:${bottom}px;width:${Math.min(width, vrect.w * 0.96)}px;min-height:${minH}px;font-size:${font}px">${text}</div>`;
+  };
+  if (!c && bridge && mode !== 'off') { const b = P.band; ov.innerHTML = place([b.cx - b.w / 2, b.bottom - b.h1, b.cx + b.w / 2, b.bottom], ''); return; }
   if (!c || mode === 'off' || (mode === 'he' ? !c.hebrew : !c.english)) { ov.innerHTML = ''; return; }
-  const [bx, by, bw, bh] = c.bbox;
-  const lines = Math.max(1, (c.hebrew.match(/\n/g) || []).length + 1);
-  const lineH = (bh * vrect.h) / lines;
-  const font = Math.max(13, Math.min(lineH * 0.82, vrect.h * 0.06));
-  const padX = lineH * 0.55, padY = lineH * 0.3;
-  const left = (bx + bw / 2) * vrect.w;
-  const bottom = vrect.h - (by + bh) * vrect.h - padY;
-  const minW = bw * vrect.w + padX * 2, minH = bh * vrect.h + padY * 2;
   let html;
   if (mode === 'en') html = `<div>${esc(c.english)}</div>`;
   else if (mode === 'he') html = `<div class="he">${esc(c.hebrew)}</div>`;
   else html = `<div>${esc(c.english)}</div><div class="he small">${esc(c.hebrew)}</div>`;
-  ov.innerHTML = `<div class="sub-box" style="left:${left}px;bottom:${bottom}px;min-width:${minW}px;min-height:${minH}px;max-width:${vrect.w * 0.96}px;font-size:${font}px">${html}</div>`;
+  ov.innerHTML = place(boxFor(c).box, html);
 }
 
 function loop() {
@@ -1091,6 +1153,10 @@ function setModeButtons() { document.querySelectorAll('#modes button').forEach((
 $('#modes').addEventListener('click', (e) => { const m = e.target.dataset.m; if (m) setMode(m); });
 function setMode(m) { P.mode = m; localStorage.setItem('subMode', m); setModeButtons(); renderOverlay(true); }
 $('#list-btn').onclick = () => toggleDrawer();
+$('#size-down').onclick = () => setScale(P.scale - 0.1);
+$('#size-up').onclick = () => setScale(P.scale + 0.1);
+$('#size-val').textContent = Math.round(P.scale * 100) + '%';
+$('#size-val').onclick = () => setScale(1);
 $('#dr-close').onclick = () => toggleDrawer(false);
 function toggleDrawer(on) {
   const open = on ?? !$('#player').classList.contains('drawer-open');
@@ -1123,6 +1189,8 @@ document.addEventListener('keydown', (e) => {
   else if (k === 'f') toggleFs();
   else if (k === 's') { const order = ['en', 'he', 'both', 'off']; setMode(order[(order.indexOf(P.mode) + 1) % 4]); toast(`Subtitles: ${({ en: 'English', he: 'Hebrew', both: 'Both', off: 'Off' })[P.mode]}`, 1200); }
   else if (k === 'e') toggleDrawer();
+  else if (k === '-' || k === '_') setScale(P.scale - 0.1);
+  else if (k === '=' || k === '+') setScale(P.scale + 0.1);
   else if (k === 'escape') { if (document.fullscreenElement) return; if ($('#player').classList.contains('drawer-open')) toggleDrawer(false); else location.hash = '#/'; }
 });
 

@@ -15,7 +15,11 @@ never uploaded. Subtitles and edits are saved in your browser only.
 4. The first time, click once to turn on English — Chrome sets up its built-in Hebrew translator.
 
 Keys: Space play/pause · ←/→ 5 s · S subtitle mode (English / Hebrew / Both / Off) ·
-E subtitle list · F fullscreen · Esc back.
+E subtitle list · − / + subtitle size (also the A− / A+ buttons) · F fullscreen · Esc back.
+
+Subtitles keep one text size and a steady backdrop: the app learns where the episode's subtitles sit
+and uses the same box for every one-line subtitle (and one for two-line ones), growing it only when
+needed to cover the Hebrew underneath.
 
 In the subtitle list, lines the app is unsure of are marked **Check Hebrew**. Fix a Hebrew line and it
 is re-translated; or edit the English directly.
